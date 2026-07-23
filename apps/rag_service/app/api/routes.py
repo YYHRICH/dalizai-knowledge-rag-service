@@ -11,6 +11,7 @@ from apps.rag_service.app.schemas.admin import (
     UpdateKnowledgeGapStatusRequest,
     UpdateKnowledgeGapStatusResponse,
 )
+from apps.rag_service.app.retrievers import QdrantKnowledgeStore, QdrantStoreSettings
 from apps.rag_service.app.schemas.rag import RagQueryRequest, RagQueryResponse
 from apps.rag_service.app.services.rag_query_service import RagQueryService
 from apps.rag_service.app.storage import MetadataRepository, SqliteDatabase
@@ -56,9 +57,26 @@ def ready(
     repository: MetadataRepository = Depends(get_metadata_repository),
 ) -> dict[str, object]:
     latest = repository.get_latest_successful_ingest_run()
+    qdrant_status: dict[str, object]
+    try:
+        store = QdrantKnowledgeStore(
+            QdrantStoreSettings(
+                url=settings.qdrant_url,
+                api_key=settings.qdrant_api_key,
+                collection_alias=settings.qdrant_collection_alias,
+                collection_prefix=settings.qdrant_collection_prefix,
+                vector_size=settings.embedding_dimension,
+            )
+        )
+        point_count = store.count_points(settings.qdrant_collection_alias)
+        qdrant_status = {"status": "ok", "pointCount": point_count}
+    except Exception as exc:
+        qdrant_status = {"status": "error", "message": str(exc)[:200]}
+    ready_status = bool(latest) and qdrant_status["status"] == "ok"
     return {
-        "status": "ready" if latest else "not_ready",
+        "status": "ready" if ready_status else "not_ready",
         "latestIngest": latest,
+        "qdrant": qdrant_status,
     }
 
 

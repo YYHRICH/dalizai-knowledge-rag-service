@@ -51,6 +51,56 @@ QDRANT_KEEP_COLLECTIONS=2
 
 每次 ingest 创建新的实际 collection，例如 `dalizai_knowledge_20260723_1030`。校验成功后，将 alias `dalizai_knowledge_v1` 切到新 collection。失败时不切 alias，旧版本继续可用。
 
+## Docker 部署
+
+第一版提供 `rag-service` 和 `qdrant` 的 Docker Compose 本地部署。
+
+启动 Qdrant：
+
+```powershell
+docker compose up -d qdrant
+```
+
+构建并启动 RAG API：
+
+```powershell
+docker compose --profile app up -d --build rag-service
+```
+
+容器内默认覆盖：
+
+```text
+QDRANT_URL=http://qdrant:6333
+RAG_METADATA_DB_URL=sqlite:////app/data/rag_service.db
+```
+
+RAG API 暴露端口：
+
+```text
+http://127.0.0.1:8100
+```
+
+如果是首次启动，需要先完成知识入库。开发期可继续在宿主机运行 ingest 脚本，也可以进入容器运行脚本；生产化后建议把 ingest 做成独立发布任务。
+
+```powershell
+.\.venv\Scripts\python scripts\ingest_knowledge.py --require-eval-questions
+```
+
+查看服务状态：
+
+```powershell
+docker compose ps
+```
+
+查看日志：
+
+```powershell
+docker compose logs -f rag-service
+```
+
+
+常见构建问题：如果构建时报 `failed to resolve source metadata for docker.io/library/python` 或镜像源 EOF，通常是 Docker Desktop 镜像源或网络问题。调整 Docker 镜像源后重新执行 build 即可。
+
 ## 健康检查
 
 - `GET /health`: 应用进程存活。

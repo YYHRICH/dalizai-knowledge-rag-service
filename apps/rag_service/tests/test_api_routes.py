@@ -131,3 +131,46 @@ def test_admin_knowledge_gaps_requires_auth() -> None:
     response = client.get("/v1/admin/knowledge-gaps")
 
     assert response.status_code == 401
+
+
+
+def test_ready_checks_ingest_and_qdrant(monkeypatch, tmp_path) -> None:
+    from apps.rag_service.app.api import routes
+    from apps.rag_service.app.storage import MetadataRepository, SqliteDatabase
+    from apps.rag_service.app.storage.repository import IngestRunRecord, utc_now_iso
+
+    class FakeQdrantStore:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def count_points(self, collection_name):
+            assert collection_name == "dalizai_knowledge_v1"
+            return 24
+
+    db_url = f"sqlite:///{tmp_path / 'rag_service.db'}"
+    monkeypatch.setattr(routes.settings, "rag_metadata_db_url", db_url)
+    monkeypatch.setattr(routes.settings, "rag_admin_api_key", "admin_key")
+    monkeypatch.setattr(routes, "QdrantKnowledgeStore", FakeQdrantStore)
+    repository = MetadataRepository(SqliteDatabase(db_url))
+    repository.initialize()
+    repository.create_ingest_run(
+        IngestRunRecord(
+            ingest_id="ingest_ready",
+            knowledge_version="kb_ready",
+            started_at=utc_now_iso(),
+            finished_at=utc_now_iso(),
+            status="success",
+            total_docs=12,
+            total_knowledge_items=24,
+            active_items=24,
+        )
+    )
+    client = TestClient(create_app())
+
+    response = client.get("/ready", headers={"Authorization": "Bearer admin_key"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["qdrant"] == {"status": "ok", "pointCount": 24}
+    assert body["latestIngest"]["ingest_id"] == "ingest_ready"

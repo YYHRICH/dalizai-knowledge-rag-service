@@ -211,7 +211,7 @@ $body = @{
 
 Invoke-RestMethod `
   -Method Post `
-  -Uri "http://127.0.0.1:8000/v1/rag/query" `
+  -Uri "http://127.0.0.1:8100/v1/rag/query" `
   -Headers @{ Authorization = "Bearer $env:RAG_SERVICE_API_KEY" } `
   -ContentType "application/json" `
   -Body $body
@@ -239,7 +239,7 @@ payload = {
 }
 
 response = httpx.post(
-    "http://127.0.0.1:8000/v1/rag/query",
+    "http://127.0.0.1:8100/v1/rag/query",
     headers={"Authorization": f"Bearer {RAG_SERVICE_API_KEY}"},
     json=payload,
     timeout=3.0,
