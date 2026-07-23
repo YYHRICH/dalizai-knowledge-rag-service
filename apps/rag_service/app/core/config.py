@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     embedding_dimension: int = 1024
     rerank_model: str = "qwen3-rerank"
     rerank_top_n: int = 10
+    query_rewrite_chat_model: str = "qwen-turbo"
     gap_cluster_chat_model: str = "qwen-turbo"
     gap_cluster_similarity_threshold: float = 0.82
     gap_cluster_batch_size: int = 100

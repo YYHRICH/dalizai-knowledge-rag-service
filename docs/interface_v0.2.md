@@ -207,7 +207,7 @@ rag_internal_error
 - RAG 负责 `queryRewrite`、召回、重排和置信度判断。
 - Agent 可以传 `normalizedQueryHint`，例如 `卡券无法使用原因`，但它只是 hint。
 - RAG 返回的 `queryRewrite` 只用于观测和审计，Agent 不应把它当成业务结论。
-- 第一版 RAG 使用确定性规则改写；后续可在不改接口的情况下切换到小 LLM 改写。
+- 第一版 RAG 直接调用 DashScope Qwen 小模型生成 `queryRewrite`，异常时退回 `query` 原文以保证服务可用。
 
 ## 9. Agent 使用规则
 

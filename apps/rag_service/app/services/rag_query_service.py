@@ -5,6 +5,7 @@ from typing import Any
 
 from apps.rag_service.app.core.config import Settings
 from apps.rag_service.app.providers.dashscope import (
+    DashScopeChatClient,
     DashScopeEmbeddingClient,
     DashScopeRerankClient,
     DashScopeSettings,
@@ -37,12 +38,15 @@ class RagQueryService:
             api_key=settings.dashscope_api_key,
             embedding_base_url=settings.dashscope_embedding_base_url,
             rerank_base_url=settings.dashscope_rerank_base_url,
+            chat_base_url=settings.dashscope_chat_base_url,
             embedding_model=settings.embedding_model,
             embedding_dimension=settings.embedding_dimension,
             rerank_model=settings.rerank_model,
+            chat_model=settings.query_rewrite_chat_model,
         )
         self.embedding_client = DashScopeEmbeddingClient(model_settings)
         self.rerank_client = DashScopeRerankClient(model_settings)
+        self.query_rewrite_client = DashScopeChatClient(model_settings)
         self.store = QdrantKnowledgeStore(
             QdrantStoreSettings(
                 url=settings.qdrant_url,
@@ -54,7 +58,7 @@ class RagQueryService:
         )
         self.repository = MetadataRepository(SqliteDatabase(settings.rag_metadata_db_url))
         self.repository.initialize()
-        self.query_rewriter = QueryRewriter()
+        self.query_rewriter = QueryRewriter(self.query_rewrite_client)
 
     def query(self, request: RagQueryRequest) -> RagQueryResponse:
         started = time.perf_counter()

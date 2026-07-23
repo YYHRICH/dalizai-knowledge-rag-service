@@ -37,6 +37,10 @@
     .low_confidence, .warn { color: var(--warn); border-color: #fedf89; background: #fffaeb; }
     .not_found, .error, .failed { color: var(--bad); border-color: #fecdca; background: #fef3f2; }
     .metrics { display: grid; grid-template-columns: repeat(5, minmax(110px, 1fr)); gap: 8px; margin-bottom: 12px; }
+    .rewrite-panel { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+    .rewrite-box { border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: #fbfcfe; min-height: 72px; }
+    .rewrite-box b { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    .rewrite-box div { white-space: pre-wrap; overflow-wrap: anywhere; }
     .metric { border: 1px solid var(--line); border-radius: 6px; padding: 8px; background: #fbfcfe; }
     .metric b { display: block; font-size: 18px; margin-top: 4px; }
     .items { display: grid; gap: 10px; }
@@ -48,7 +52,7 @@
     pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #101828; color: #f2f4f7; border-radius: 8px; padding: 10px; max-height: 320px; overflow: auto; }
     .muted { color: var(--muted); }
     .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
-    @media (max-width: 980px) { main { grid-template-columns: 1fr; } .metrics { grid-template-columns: 1fr 1fr; } .claims { grid-template-columns: 1fr; } }
+    @media (max-width: 980px) { main { grid-template-columns: 1fr; } .metrics { grid-template-columns: 1fr 1fr; } .claims { grid-template-columns: 1fr; } .rewrite-panel { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -131,6 +135,10 @@
 
     <section>
       <h2>结果观察</h2>
+      <div class="rewrite-panel">
+        <div class="rewrite-box"><b>原话</b><div id="observedOriginal">-</div></div>
+        <div class="rewrite-box"><b>改写后的句子</b><div id="observedRewrite">-</div></div>
+      </div>
       <div id="summary" class="metrics"></div>
       <div id="items" class="items"></div>
       <h2 style="margin-top:16px">原始响应</h2>
@@ -211,6 +219,8 @@
     function render(data) {
       const r = data.response;
       const e = data.evaluation;
+      $('observedOriginal').textContent = r.requestId ? (payload().originalQuery || payload().query || '-') : '-';
+      $('observedRewrite').textContent = r.queryRewrite || '-';
       $('summary').innerHTML = [
         metric('status', r.status, r.status),
         metric('confidence', Number(r.confidence).toFixed(4)),
