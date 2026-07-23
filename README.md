@@ -41,3 +41,23 @@ docker compose up qdrant
 - `eval`: 检索评测集
 - `docs`: 接口、架构、知识格式文档
 - `scripts`: 入库、复核、评测脚本
+
+## 常用命令
+
+校验知识：
+
+```powershell
+.\.venv\Scripts\python scripts\ingest_knowledge.py --require-eval-questions --validate-only
+```
+
+入库知识：
+
+```powershell
+.\.venv\Scripts\python scripts\ingest_knowledge.py --require-eval-questions
+```
+
+运行 RAG 评测：
+
+```powershell
+.\.venv\Scripts\python scripts\run_eval.py --knowledge-dir knowledge --fail-under 0.75
+```

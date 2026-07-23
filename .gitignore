@@ -12,3 +12,4 @@ qdrant_storage/
 Thumbs.db
 # Local incoming datasets and runtime metadata DB
 data/
+eval/reports/

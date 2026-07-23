@@ -96,6 +96,30 @@ PATCH /v1/admin/knowledge-gaps/{cluster_id}/status
 
 建议频率：前期每天 1 次；上线初期或高流量阶段可每小时 1 次。
 
+## RAG 评测
+
+评测脚本用于检索回归，不生成最终对客回答。第一版参考 Ragas 思路，输出以下指标：
+
+- `statusAccuracy`: `success / low_confidence / not_found` 是否符合预期。
+- `contextPrecision`: 召回上下文是否少噪声，越靠前命中越好。
+- `contextRecall`: 期望上下文是否被召回。
+- `faithfulnessProxy`: 返回知识是否覆盖评测集中的 `expectedClaims`。
+- `responseRelevancyProxy`: RAG 返回的知识是否足以支撑参考回答。
+
+从 Markdown `Eval Questions` 加载评测集：
+
+```powershell
+.\.venv\Scripts\python scripts\run_eval.py --knowledge-dir knowledge --fail-under 0.75
+```
+
+从独立 JSONL 加载评测集：
+
+```powershell
+.\.venv\Scripts\python scripts\run_eval.py --cases-jsonl eval\questions.jsonl --fail-under 0.75
+```
+
+报告默认写入 `eval/reports/`，该目录为本地运行产物，不提交到 Git。
+
 ## 日志隐私
 
 - `userId`、`sessionId` 记录 hash。
