@@ -81,7 +81,9 @@
       <label>用户原话 originalQuery</label>
       <textarea id="originalQuery" placeholder="例如：第一次用这个桩怎么开始？"></textarea>
       <label>检索 query</label>
-      <textarea id="query" placeholder="可填 Agent 改写后的检索 query"></textarea>
+      <textarea id="query" placeholder="可填用户原话或 Agent 轻量处理后的 query"></textarea>
+      <label>normalizedQueryHint</label>
+      <input id="normalizedQueryHint" placeholder="可选，例如：卡券无法使用原因" />
       <div class="row">
         <div>
           <label>businessDomains</label>
@@ -157,6 +159,7 @@
     function fillFromCase(item) {
       $('originalQuery').value = item.query;
       $('query').value = item.query;
+      $('normalizedQueryHint').value = '';
       $('businessDomains').value = item.businessDomains.join(',');
       $('knowledgeTypes').value = item.knowledgeTypes.join(',');
       $('intent').value = item.intent || '';
@@ -184,6 +187,7 @@
         channel: 'wechat_mini_program',
         originalQuery: $('originalQuery').value.trim() || null,
         query: $('query').value.trim(),
+        normalizedQueryHint: $('normalizedQueryHint').value.trim() || null,
         intent: $('intent').value.trim() || null,
         subIntent: $('subIntent').value.trim() || null,
         topK: Number($('topK').value || 5),

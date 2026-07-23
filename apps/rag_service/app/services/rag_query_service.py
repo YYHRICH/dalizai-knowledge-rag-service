@@ -21,6 +21,7 @@ from apps.rag_service.app.schemas.rag import (
     RagQueryRequest,
     RagQueryResponse,
 )
+from apps.rag_service.app.services.query_rewriter import QueryRewriter
 from apps.rag_service.app.storage import MetadataRepository, SqliteDatabase
 from apps.rag_service.app.storage.repository import (
     AuditLogRecord,
@@ -53,12 +54,13 @@ class RagQueryService:
         )
         self.repository = MetadataRepository(SqliteDatabase(settings.rag_metadata_db_url))
         self.repository.initialize()
+        self.query_rewriter = QueryRewriter()
 
     def query(self, request: RagQueryRequest) -> RagQueryResponse:
         started = time.perf_counter()
         top_k = min(request.topK or self.settings.rag_default_top_k, self.settings.rag_max_top_k)
         recall_limit = max(top_k, self.settings.rerank_top_n)
-        query_rewrite = request.query
+        query_rewrite = self.query_rewriter.rewrite(request)
 
         try:
             embedding = self.embedding_client.embed_texts([query_rewrite]).embeddings[0]

@@ -22,7 +22,8 @@ Authorization: Bearer ${RAG_SERVICE_API_KEY}
   "userId": "user_001",
   "channel": "wechat_mini_program",
   "originalQuery": "我不会弄那个充电，扫哪里啊",
-  "query": "扫码充电操作步骤",
+  "query": "我不会弄那个充电，扫哪里啊",
+  "normalizedQueryHint": "扫码充电操作步骤",
   "intent": "faq",
   "subIntent": "charge_scan_guide",
   "topK": 5,
@@ -47,7 +48,8 @@ Authorization: Bearer ${RAG_SERVICE_API_KEY}
 | `userId` | string | 否 | 用户 ID，RAG 日志中 hash 存储 |
 | `channel` | string | 是 | 第一版固定支持 `wechat_mini_program` |
 | `originalQuery` | string | 否 | 用户原始表达，未传时视为等同 `query` |
-| `query` | string | 是 | RAG 实际检索文本，可以是原话或 Agent 改写后文本 |
+| `query` | string | 是 | Agent 传给 RAG 的查询文本，可以是用户原话或轻量处理后的文本 |
+| `normalizedQueryHint` | string | 否 | Agent 对明确意图给出的归一化提示，只作为 RAG query rewrite 的辅助信号，不替代 RAG 改写 |
 | `intent` | string | 否 | Agent 识别出的主意图 |
 | `subIntent` | string | 否 | Agent 识别出的子意图 |
 | `topK` | integer | 否 | 默认 5，最大 10 |
@@ -73,7 +75,7 @@ Authorization: Bearer ${RAG_SERVICE_API_KEY}
   "status": "success",
   "answerable": true,
   "confidence": 0.86,
-  "queryRewrite": "扫码充电操作步骤",
+  "queryRewrite": "扫码充电操作步骤；连接充电枪后扫码启动充电；我不会弄那个充电，扫哪里啊",
   "knowledgeVersion": "kb_2026_07_23_1000",
   "items": [
     {
@@ -199,7 +201,15 @@ rag_internal_error
 
 后续预留按 `knowledgeType` 配置不同阈值。
 
-## 8. Agent 使用规则
+## 8. Query Rewrite 边界
+
+- Agent 负责意图识别、子意图、槽位、页面上下文和风险等级判断。
+- RAG 负责 `queryRewrite`、召回、重排和置信度判断。
+- Agent 可以传 `normalizedQueryHint`，例如 `卡券无法使用原因`，但它只是 hint。
+- RAG 返回的 `queryRewrite` 只用于观测和审计，Agent 不应把它当成业务结论。
+- 第一版 RAG 使用确定性规则改写；后续可在不改接口的情况下切换到小 LLM 改写。
+
+## 9. Agent 使用规则
 
 - Reply Agent 优先基于 `allowedClaims` 组织回复。
 - `content` 是知识正文参考，不是最终对客答案。
@@ -208,7 +218,7 @@ rag_internal_error
 - `cards` 第一版保留字段，默认空数组，由 Agent/MCP adapter 决定是否展示。
 
 
-## 9. 联调资料
+## 10. 联调资料
 
 Agent 侧调用时机、filters 推荐组合、返回结果消费规则见：
 

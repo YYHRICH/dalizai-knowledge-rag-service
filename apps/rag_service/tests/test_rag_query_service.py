@@ -32,6 +32,11 @@ class FakeRerankClient:
         return [RerankResult(id="faq_charge_scan_001#main", index=0, score=0.93)]
 
 
+class FakeQueryRewriter:
+    def rewrite(self, request):
+        return request.query
+
+
 class FakeRepository:
     def __init__(self):
         self.audit_logs = []
@@ -74,6 +79,7 @@ def service_with(points):
     service.store = FakeStore(points)
     service.rerank_client = FakeRerankClient()
     service.repository = FakeRepository()
+    service.query_rewriter = FakeQueryRewriter()
     return service
 
 

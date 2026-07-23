@@ -77,7 +77,8 @@ Content-Type: application/json
   "userId": "user_001",
   "channel": "wechat_mini_program",
   "originalQuery": "我不会扫码充电，扫哪里啊？",
-  "query": "扫码充电操作步骤",
+  "query": "我不会扫码充电，扫哪里啊？",
+  "normalizedQueryHint": "扫码充电操作步骤",
   "intent": "faq",
   "subIntent": "charge_scan_guide",
   "topK": 5,
@@ -98,11 +99,47 @@ Content-Type: application/json
 - `traceId`: 用户请求全链路 trace ID，便于排查。
 - `sessionId/userId`: 可以传，RAG 只 hash 入库。
 - `originalQuery`: 用户原话，便于审计和知识缺口分析。
-- `query`: Agent 改写后的检索 query；如果不改写，等于原话。
+- `query`: Agent 传给 RAG 的查询文本，可以等于用户原话。
+- `normalizedQueryHint`: 可选。Agent 对非常明确意图给出的归一化提示，只作为 RAG 改写辅助信号。
 - `filters`: 推荐传业务域和知识类型，避免跨域误召回。
 - `context`: 只传脱敏、低风险上下文；不要传订单明细、余额、手机号、身份证等敏感或实时业务真值。
 
-## 5. 推荐 filters 组合
+## 5. Query Rewrite 职责边界
+
+约定边界：
+
+- Agent 做：意图识别、子意图、槽位、页面上下文、风险等级。
+- RAG 做：query rewrite、召回、重排、置信度判断。
+- Agent 使用：RAG 返回的 `queryRewrite` 只用于观测和审计，不作为业务结论。
+
+Agent 如果已经非常明确用户意图，可以传 `normalizedQueryHint`：
+
+```json
+{
+  "query": "这个券咋用不了",
+  "intent": "coupon_service",
+  "subIntent": "coupon_not_show",
+  "normalizedQueryHint": "卡券无法使用原因",
+  "channel": "wechat_mini_program",
+  "context": {
+    "pageContext": {
+      "page": "order_checkout"
+    }
+  }
+}
+```
+
+RAG 会综合 `query`、`normalizedQueryHint`、`intent/subIntent`、`filters`、`context` 生成最终 `queryRewrite`，例如：
+
+```json
+{
+  "queryRewrite": "卡券无法使用原因；卡券使用条件；订单结算页未展示卡券；这个券咋用不了"
+}
+```
+
+第一版 RAG 使用确定性规则改写，后续可以接小 LLM 做更自然的多路 query rewrite。
+
+## 6. 推荐 filters 组合
 
 | 场景 | businessDomains | knowledgeTypes |
 | --- | --- | --- |
@@ -119,7 +156,7 @@ Content-Type: application/json
 
 第一版不强制限制组合，但建议按上表传，减少噪声。
 
-## 6. Response 消费规则
+## 7. Response 消费规则
 
 ### success
 
@@ -164,7 +201,7 @@ RAG 依赖异常或服务异常。
 - 可按 `error.retryable=true` 做一次短重试。
 - 不要因为 RAG error 编造答案。
 
-## 7. Agent 回复组装伪代码
+## 8. Agent 回复组装伪代码
 
 ```python
 def handle_rag_result(rag_result):
@@ -186,7 +223,7 @@ def handle_rag_result(rag_result):
         return safe_fallback()
 ```
 
-## 8. Curl 示例
+## 9. Curl 示例
 
 ```powershell
 $body = @{
@@ -196,6 +233,7 @@ $body = @{
   channel = "wechat_mini_program"
   originalQuery = "第一次用这个桩怎么开始？"
   query = "第一次用这个桩怎么开始？"
+  normalizedQueryHint = "扫码充电操作步骤"
   intent = "faq"
   subIntent = "charge_scan_guide"
   topK = 5
@@ -217,7 +255,7 @@ Invoke-RestMethod `
   -Body $body
 ```
 
-## 9. Python 调用示例
+## 10. Python 调用示例
 
 ```python
 import httpx
@@ -228,7 +266,8 @@ payload = {
     "sessionId": "session_demo_001",
     "channel": "wechat_mini_program",
     "originalQuery": "优惠券能不能叠加？",
-    "query": "卡券是否可以叠加使用",
+    "query": "优惠券能不能叠加？",
+    "normalizedQueryHint": "卡券是否可以叠加使用",
     "intent": "faq",
     "subIntent": "coupon_stack_rule",
     "filters": {
@@ -248,7 +287,7 @@ response.raise_for_status()
 rag_result = response.json()
 ```
 
-## 10. 联调验收标准
+## 11. 联调验收标准
 
 第一轮 Agent-RAG 联调建议通过以下验收：
 
@@ -261,7 +300,7 @@ rag_result = response.json()
 - `eval/agent_cases.jsonl` 样例能作为联调基准。
 
 
-## 11. 调试台
+## 12. 调试台
 
 开发联调时可以打开：
 

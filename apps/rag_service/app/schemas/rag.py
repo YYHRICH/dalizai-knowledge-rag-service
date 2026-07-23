@@ -23,6 +23,7 @@ class RagQueryRequest(BaseModel):
     channel: str = "wechat_mini_program"
     originalQuery: str | None = None
     query: str
+    normalizedQueryHint: str | None = None
     intent: str | None = None
     subIntent: str | None = None
     topK: int | None = Field(default=None, ge=1)

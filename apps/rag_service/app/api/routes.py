@@ -241,6 +241,7 @@ def debug_query(
         channel=request.channel,
         originalQuery=request.originalQuery,
         query=request.query,
+        normalizedQueryHint=request.normalizedQueryHint,
         intent=request.intent,
         subIntent=request.subIntent,
         topK=request.topK,
