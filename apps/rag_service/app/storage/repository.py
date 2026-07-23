@@ -182,6 +182,87 @@ class MetadataRepository:
                 ),
             )
 
+    def list_unclustered_gap_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM knowledge_gap_events
+                WHERE cluster_id IS NULL
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._decode_gap_event_row(dict(row)) for row in rows]
+
+    def list_open_gap_clusters(self) -> list[dict[str, Any]]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM knowledge_gap_clusters
+                WHERE handled_status = 'open'
+                ORDER BY last_seen_at DESC
+                """
+            ).fetchall()
+        return [self._decode_gap_cluster_row(dict(row)) for row in rows]
+
+    def assign_gap_events_to_cluster(self, gap_event_ids: list[str], cluster_id: str) -> None:
+        if not gap_event_ids:
+            return
+        with self.database.connect() as connection:
+            connection.executemany(
+                """
+                UPDATE knowledge_gap_events
+                SET cluster_id = ?
+                WHERE gap_event_id = ?
+                """,
+                [(cluster_id, gap_event_id) for gap_event_id in gap_event_ids],
+            )
+
+    def upsert_gap_cluster(self, record: KnowledgeGapClusterRecord) -> None:
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO knowledge_gap_clusters (
+                    cluster_id, representative_query, cluster_title, summary,
+                    business_domain_guess, knowledge_type_guess, owner_team,
+                    event_count, status_breakdown_json,
+                    top_candidate_knowledge_ids_json, query_examples_json,
+                    handled_status, first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cluster_id) DO UPDATE SET
+                    representative_query = excluded.representative_query,
+                    cluster_title = excluded.cluster_title,
+                    summary = excluded.summary,
+                    business_domain_guess = excluded.business_domain_guess,
+                    knowledge_type_guess = excluded.knowledge_type_guess,
+                    owner_team = excluded.owner_team,
+                    event_count = excluded.event_count,
+                    status_breakdown_json = excluded.status_breakdown_json,
+                    top_candidate_knowledge_ids_json = excluded.top_candidate_knowledge_ids_json,
+                    query_examples_json = excluded.query_examples_json,
+                    first_seen_at = excluded.first_seen_at,
+                    last_seen_at = excluded.last_seen_at,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    record.cluster_id,
+                    record.representative_query,
+                    record.cluster_title,
+                    record.summary,
+                    record.business_domain_guess,
+                    record.knowledge_type_guess,
+                    record.owner_team,
+                    record.event_count,
+                    json.dumps(record.status_breakdown, ensure_ascii=False),
+                    json.dumps(record.top_candidate_knowledge_ids, ensure_ascii=False),
+                    json.dumps(record.query_examples, ensure_ascii=False),
+                    record.handled_status,
+                    record.first_seen_at,
+                    record.last_seen_at,
+                ),
+            )
+
     def create_gap_cluster(self, record: KnowledgeGapClusterRecord) -> None:
         with self.database.connect() as connection:
             connection.execute(
@@ -291,3 +372,19 @@ class MetadataRepository:
                     """
                 ).fetchall()
             return [dict(row) for row in rows]
+
+
+    def _decode_gap_event_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        row["filters"] = json.loads(row.pop("filters_json") or "{}")
+        row["top_candidate_knowledge_ids"] = json.loads(
+            row.pop("top_candidate_knowledge_ids_json") or "[]"
+        )
+        return row
+
+    def _decode_gap_cluster_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        row["status_breakdown"] = json.loads(row.pop("status_breakdown_json") or "{}")
+        row["top_candidate_knowledge_ids"] = json.loads(
+            row.pop("top_candidate_knowledge_ids_json") or "[]"
+        )
+        row["query_examples"] = json.loads(row.pop("query_examples_json") or "[]")
+        return row

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import httpx
 
 from .errors import ModelProviderAuthError, ModelProviderBadRequestError, ModelProviderError
-from .models import EmbeddingResult, RerankDocument, RerankResult
+from .models import ChatCompletionResult, EmbeddingResult, RerankDocument, RerankResult
 
 
 @dataclass(frozen=True)
@@ -13,9 +13,11 @@ class DashScopeSettings:
     api_key: str
     embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     rerank_base_url: str = "https://dashscope.aliyuncs.com/compatible-api/v1"
+    chat_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     embedding_model: str = "qwen3.7-text-embedding"
     embedding_dimension: int = 1024
     rerank_model: str = "qwen3-rerank"
+    chat_model: str = "qwen-turbo"
     timeout_seconds: float = 60.0
 
 
@@ -153,6 +155,83 @@ class DashScopeRerankClient:
                 )
             )
         return results
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.settings.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _handle_response(self, response: httpx.Response) -> dict:
+        if response.status_code in {401, 403}:
+            raise ModelProviderAuthError()
+        if 400 <= response.status_code < 500:
+            raise ModelProviderBadRequestError(
+                self._extract_error_message(response),
+                status_code=response.status_code,
+            )
+        if response.status_code >= 500:
+            raise ModelProviderError(
+                self._extract_error_message(response),
+                retryable=True,
+                status_code=response.status_code,
+            )
+        return response.json()
+
+    def _extract_error_message(self, response: httpx.Response) -> str:
+        try:
+            data = response.json()
+        except ValueError:
+            return response.text[:300] or "Model provider request failed"
+        error = data.get("error") if isinstance(data, dict) else None
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        if isinstance(data, dict) and data.get("message"):
+            return str(data["message"])
+        return "Model provider request failed"
+
+
+class DashScopeChatClient:
+    def __init__(
+        self,
+        settings: DashScopeSettings,
+        http_client: httpx.Client | None = None,
+    ) -> None:
+        self.settings = settings
+        self._client = http_client or httpx.Client(timeout=settings.timeout_seconds)
+        self._owns_client = http_client is None
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
+
+    def complete_json(self, system_prompt: str, user_prompt: str) -> ChatCompletionResult:
+        response = self._client.post(
+            f"{self.settings.chat_base_url.rstrip('/')}/chat/completions",
+            headers=self._headers(),
+            json={
+                "model": self.settings.chat_model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            },
+        )
+        data = self._handle_response(response)
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ModelProviderError("Invalid chat completion response", retryable=True)
+        message = choices[0].get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str) or not content.strip():
+            raise ModelProviderError("Empty chat completion content", retryable=True)
+        return ChatCompletionResult(
+            model=data.get("model") or self.settings.chat_model,
+            content=content,
+            usage=data.get("usage"),
+        )
 
     def _headers(self) -> dict[str, str]:
         return {

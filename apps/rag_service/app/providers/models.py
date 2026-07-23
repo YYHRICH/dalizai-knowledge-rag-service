@@ -22,3 +22,10 @@ class RerankResult:
     id: str
     index: int
     score: float
+
+
+@dataclass(frozen=True)
+class ChatCompletionResult:
+    model: str
+    content: str
+    usage: dict | None = None

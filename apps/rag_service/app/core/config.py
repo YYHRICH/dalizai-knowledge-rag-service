@@ -21,10 +21,14 @@ class Settings(BaseSettings):
     dashscope_api_key: str = "CHANGE_ME_DASHSCOPE_API_KEY"
     dashscope_embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     dashscope_rerank_base_url: str = "https://dashscope.aliyuncs.com/compatible-api/v1"
+    dashscope_chat_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     embedding_model: str = "qwen3.7-text-embedding"
     embedding_dimension: int = 1024
     rerank_model: str = "qwen3-rerank"
     rerank_top_n: int = 10
+    gap_cluster_chat_model: str = "qwen-turbo"
+    gap_cluster_similarity_threshold: float = 0.82
+    gap_cluster_batch_size: int = 100
 
     rag_metadata_db_url: str = "sqlite:///data/rag_service.db"
 

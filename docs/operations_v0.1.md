@@ -65,6 +65,34 @@ GET /v1/admin/knowledge-gaps
 
 管理接口使用独立 `RAG_ADMIN_API_KEY`，第一版只做查询，不做知识编辑。
 
+## 知识缺口聚类
+
+实时查询链路只记录 `not_found` / `low_confidence` 到 `knowledge_gap_events`，不做聚类，避免影响接口延迟。
+
+建议通过定时任务运行：
+
+```powershell
+.\.venv\Scripts\python scripts\cluster_gap_events.py --limit 100
+```
+
+常用参数：
+
+```text
+--limit 100                    单次最多处理的未聚类事件数
+--similarity-threshold 0.82     embedding 余弦相似度聚类阈值
+--dry-run                       只预览，不写库
+--disable-llm                   不调用小模型，使用规则标题和摘要
+```
+
+第一版聚类策略：
+
+- 使用 DashScope embedding 对未聚类问题向量化。
+- 优先归并到已有 open cluster；低于阈值则创建新 cluster。
+- 使用 DashScope 小模型为 cluster 生成标题和摘要；失败时退回规则生成。
+- 聚类完成后回写 `knowledge_gap_events.cluster_id`，业务人员后续围绕 cluster 补知识。
+
+建议频率：前期每天 1 次；上线初期或高流量阶段可每小时 1 次。
+
 ## 日志隐私
 
 - `userId`、`sessionId` 记录 hash。

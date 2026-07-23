@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from apps.rag_service.app.providers.dashscope import (
+    DashScopeChatClient,
     DashScopeEmbeddingClient,
     DashScopeRerankClient,
     DashScopeSettings,
@@ -106,3 +107,30 @@ def test_provider_raises_auth_error() -> None:
 
     with pytest.raises(ModelProviderAuthError):
         embedding_client.embed_texts(["hello"])
+
+
+def test_chat_client_posts_expected_payload() -> None:
+    seen_request = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_request["url"] = str(request.url)
+        seen_request["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen-turbo",
+                "choices": [{"message": {"content": '{"title":"扫码失败","summary":"用户反馈二维码无法识别。"}'}}],
+                "usage": {"total_tokens": 20},
+            },
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    chat_client = DashScopeChatClient(settings(), client)
+
+    result = chat_client.complete_json("system", "user")
+
+    assert seen_request["url"].endswith("/compatible-mode/v1/chat/completions")
+    assert seen_request["payload"]["model"] == "qwen-turbo"
+    assert seen_request["payload"]["response_format"] == {"type": "json_object"}
+    assert result.content == '{"title":"扫码失败","summary":"用户反馈二维码无法识别。"}'
+    assert result.usage == {"total_tokens": 20}

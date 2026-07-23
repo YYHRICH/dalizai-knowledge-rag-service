@@ -155,3 +155,45 @@ def test_gap_cluster_event_and_status_update(tmp_path) -> None:
     assert len(clusters) == 1
     assert clusters[0]["cluster_id"] == cluster_id
     assert clusters[0]["handled_status"] == "resolved"
+
+
+def test_list_and_assign_unclustered_gap_events(tmp_path) -> None:
+    repository, db_path = repository_for(tmp_path)
+    repository.create_gap_event(
+        KnowledgeGapEventRecord(
+            gap_event_id="gap_event_unclustered",
+            request_id="request_gap_unclustered",
+            trace_id="trace_gap_unclustered",
+            channel="wechat_mini_program",
+            query_masked="二维码扫不出来怎么办？",
+            status="not_found",
+            filters={"businessDomains": ["device"]},
+            business_domain_guess="device",
+            top_candidate_knowledge_ids=["candidate_001"],
+        )
+    )
+
+    events = repository.list_unclustered_gap_events(limit=10)
+
+    assert len(events) == 1
+    assert events[0]["gap_event_id"] == "gap_event_unclustered"
+    assert events[0]["filters"] == {"businessDomains": ["device"]}
+    assert events[0]["top_candidate_knowledge_ids"] == ["candidate_001"]
+
+    now = utc_now_iso()
+    repository.create_gap_cluster(
+        KnowledgeGapClusterRecord(
+            cluster_id="gap_cluster_001",
+            representative_query="二维码扫不出来怎么办？",
+            first_seen_at=now,
+            last_seen_at=now,
+        )
+    )
+    repository.assign_gap_events_to_cluster(["gap_event_unclustered"], "gap_cluster_001")
+
+    with sqlite3.connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT cluster_id FROM knowledge_gap_events WHERE gap_event_id = ?",
+            ("gap_event_unclustered",),
+        ).fetchone()
+    assert row[0] == "gap_cluster_001"
