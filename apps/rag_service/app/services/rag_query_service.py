@@ -10,6 +10,7 @@ from apps.rag_service.app.providers.dashscope import (
     DashScopeSettings,
 )
 from apps.rag_service.app.providers.errors import ModelProviderError
+from apps.rag_service.app.privacy import hash_identifier, mask_text
 from apps.rag_service.app.providers.models import RerankDocument
 from apps.rag_service.app.retrievers import QdrantKnowledgeStore, QdrantStoreSettings
 from apps.rag_service.app.schemas.rag import (
@@ -19,6 +20,12 @@ from apps.rag_service.app.schemas.rag import (
     RagFallback,
     RagQueryRequest,
     RagQueryResponse,
+)
+from apps.rag_service.app.storage import MetadataRepository, SqliteDatabase
+from apps.rag_service.app.storage.repository import (
+    AuditLogRecord,
+    KnowledgeGapEventRecord,
+    new_id,
 )
 
 
@@ -44,6 +51,8 @@ class RagQueryService:
                 vector_size=settings.embedding_dimension,
             )
         )
+        self.repository = MetadataRepository(SqliteDatabase(settings.rag_metadata_db_url))
+        self.repository.initialize()
 
     def query(self, request: RagQueryRequest) -> RagQueryResponse:
         started = time.perf_counter()
@@ -146,7 +155,6 @@ class RagQueryService:
             started=started,
         )
 
-
     def _error_response(
         self,
         request: RagQueryRequest,
@@ -155,7 +163,7 @@ class RagQueryService:
         message: str,
         retryable: bool,
     ) -> RagQueryResponse:
-        return RagQueryResponse(
+        response = RagQueryResponse(
             requestId=request.requestId,
             traceId=request.traceId,
             status="error",
@@ -168,14 +176,73 @@ class RagQueryService:
             fallback=RagFallback(reason="rag_unavailable", suggestedAction="safe_fallback"),
             latencyMs=int((time.perf_counter() - started) * 1000),
         )
+        self._record_query(request, response)
+        return response
 
     def _response(self, request: RagQueryRequest, started: float, **kwargs: Any) -> RagQueryResponse:
-        return RagQueryResponse(
+        response = RagQueryResponse(
             requestId=request.requestId,
             traceId=request.traceId,
             latencyMs=int((time.perf_counter() - started) * 1000),
             **kwargs,
         )
+        self._record_query(request, response)
+        return response
+
+    def _record_query(self, request: RagQueryRequest, response: RagQueryResponse) -> None:
+        try:
+            salt = self.settings.rag_service_api_key
+            top_knowledge_ids = [item.knowledgeId for item in response.items]
+            top_chunk_ids = [item.chunkId for item in response.items]
+            top_doc_ids = [item.source.docId for item in response.items if item.source.docId]
+            self.repository.create_audit_log(
+                AuditLogRecord(
+                    audit_id=new_id("audit"),
+                    request_id=request.requestId,
+                    trace_id=request.traceId,
+                    session_id_hash=hash_identifier(request.sessionId, salt),
+                    user_id_hash=hash_identifier(request.userId, salt),
+                    channel=request.channel,
+                    original_query_masked=mask_text(request.originalQuery),
+                    query_masked=mask_text(request.query) or "",
+                    intent=request.intent,
+                    sub_intent=request.subIntent,
+                    filters=request.filters.model_dump(),
+                    status=response.status,
+                    answerable=response.answerable,
+                    confidence=response.confidence,
+                    top_knowledge_ids=top_knowledge_ids,
+                    top_chunk_ids=top_chunk_ids,
+                    top_doc_ids=top_doc_ids,
+                    knowledge_version=response.knowledgeVersion,
+                    latency_ms=response.latencyMs,
+                    error_code=response.error.code if response.error else None,
+                )
+            )
+            if response.status in {"not_found", "low_confidence"}:
+                self.repository.create_gap_event(
+                    KnowledgeGapEventRecord(
+                        gap_event_id=new_id("gap_event"),
+                        request_id=request.requestId,
+                        trace_id=request.traceId,
+                        session_id_hash=hash_identifier(request.sessionId, salt),
+                        user_id_hash=hash_identifier(request.userId, salt),
+                        channel=request.channel,
+                        original_query_masked=mask_text(request.originalQuery),
+                        query_masked=mask_text(request.query) or "",
+                        intent=request.intent,
+                        sub_intent=request.subIntent,
+                        filters=request.filters.model_dump(),
+                        status=response.status,
+                        confidence=response.confidence,
+                        business_domain_guess=(request.filters.businessDomains or [None])[0],
+                        knowledge_type_guess=(request.filters.knowledgeTypes or [None])[0],
+                        top_candidate_knowledge_ids=top_knowledge_ids,
+                    )
+                )
+        except Exception:
+            # Audit logging must never break user-facing RAG responses.
+            return
 
     def _rerank_text(self, payload: dict[str, Any]) -> str:
         parts = [

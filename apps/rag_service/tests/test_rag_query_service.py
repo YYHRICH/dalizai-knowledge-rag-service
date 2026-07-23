@@ -32,6 +32,18 @@ class FakeRerankClient:
         return [RerankResult(id="faq_charge_scan_001#main", index=0, score=0.93)]
 
 
+class FakeRepository:
+    def __init__(self):
+        self.audit_logs = []
+        self.gap_events = []
+
+    def create_audit_log(self, record):
+        self.audit_logs.append(record)
+
+    def create_gap_event(self, record):
+        self.gap_events.append(record)
+
+
 def settings():
     return SimpleNamespace(
         rag_default_top_k=5,
@@ -40,6 +52,7 @@ def settings():
         qdrant_collection_alias="dalizai_knowledge_v1",
         success_confidence_threshold=0.75,
         low_confidence_threshold=0.50,
+        rag_service_api_key="test_salt",
     )
 
 
@@ -60,6 +73,7 @@ def service_with(points):
     service.embedding_client = FakeEmbeddingClient()
     service.store = FakeStore(points)
     service.rerank_client = FakeRerankClient()
+    service.repository = FakeRepository()
     return service
 
 
@@ -95,6 +109,13 @@ def test_query_success_response() -> None:
     assert response.knowledgeVersion == "kb_test"
     assert response.items[0].knowledgeId == "faq_charge_scan_001"
     assert service.store.seen_channel == "wechat_mini_program"
+    assert len(service.repository.audit_logs) == 1
+    audit_log = service.repository.audit_logs[0]
+    assert audit_log.status == "success"
+    assert audit_log.query_masked == "怎么扫码充电？"
+    assert audit_log.session_id_hash is not None
+    assert audit_log.top_knowledge_ids == ["faq_charge_scan_001"]
+    assert service.repository.gap_events == []
 
 
 def test_query_not_found_when_no_points() -> None:
@@ -107,3 +128,10 @@ def test_query_not_found_when_no_points() -> None:
     assert response.items == []
     assert response.fallback is not None
     assert response.fallback.reason == "no_relevant_knowledge"
+    assert len(service.repository.audit_logs) == 1
+    assert service.repository.audit_logs[0].status == "not_found"
+    assert len(service.repository.gap_events) == 1
+    gap_event = service.repository.gap_events[0]
+    assert gap_event.status == "not_found"
+    assert gap_event.business_domain_guess == "charging"
+    assert gap_event.knowledge_type_guess == "faq"
