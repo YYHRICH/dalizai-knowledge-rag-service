@@ -122,7 +122,11 @@ E:\FAQ_RAG
   README.md
 ```
 
-## 6. 知识组织
+## 6. 知识组织与存储路线
+
+### 6.1 第一阶段：Markdown + Git
+
+第一版知识源使用 Markdown 文件，并随 RAG 服务仓库一起维护。开发和早期生产阶段可以直接使用当前仓库的 `knowledge/` 目录。
 
 知识库按业务域组织。一个 Markdown 文件是一个知识集合，一个二级标题是一条知识。
 
@@ -132,6 +136,55 @@ E:\FAQ_RAG
 - `knowledgeType`: 知识类型，例如 `faq`、`operation_guide`、`billing_policy`、`coupon_policy`、`refund_policy`、`troubleshooting`、`handoff_guide`
 
 一条知识默认生成一个 chunk 和一个 Qdrant point。`chunkId` 默认是 `knowledgeId#main`。过长知识后续允许按段落拆为多个 chunk。
+
+### 6.2 第二阶段：独立知识仓库
+
+当生产知识变多、业务维护频率提高后，建议拆出独立知识仓库，例如：
+
+```text
+dalizai-knowledge-base
+```
+
+RAG 服务仓库只保留代码、schema、ingest 和评测工具。知识仓库维护：
+
+```text
+knowledge/
+eval/
+review/
+```
+
+RAG 服务通过配置读取知识目录：
+
+```text
+KNOWLEDGE_BASE_DIR=E:\dalizai-knowledge-base\knowledge
+```
+
+这样知识发布和服务代码发布可以解耦。
+
+### 6.3 第三阶段：知识维护平台 + 数据库
+
+中后期建议建设知识维护平台。数据库作为业务编辑态和治理态主存储，保存草稿、审核、版本、负责人、复核任务和操作日志。Markdown 或 JSON 可以作为发布快照、审计备份或导出产物。
+
+推荐原则：
+
+```text
+数据库：知识编辑、审核、版本、权限、复核、操作日志
+发布快照：已审核通过的稳定知识版本，可为 Markdown/JSON/发布表
+Qdrant：检索索引，只存 vector + payload，不作为知识主库
+```
+
+RAG ingest 只读取已发布快照，不直接读取编辑中的草稿数据。
+
+后续平台数据库可包含：
+
+```text
+knowledge_documents
+knowledge_items
+knowledge_versions
+knowledge_publish_runs
+knowledge_review_tasks
+knowledge_audit_logs
+```
 
 ## 7. 知识生命周期
 
@@ -297,7 +350,7 @@ GET /v1/admin/knowledge-gaps
   -> 输出入库报告
 ```
 
-第一版固定 collection：`dalizai_knowledge_v1`。每次 ingest 全量重建。后续如需灰度、回滚，再引入多 collection 或 alias 切换。
+第一版使用 alias 安全发布。对外查询 alias 为 `dalizai_knowledge_v1`，每次 ingest 创建新的实际 collection，例如 `dalizai_knowledge_20260723_1030`。校验成功后切换 alias；失败时不切 alias，旧版本继续可用。默认保留最近 2 个实际 collection。
 
 ## 16. 测试和验收
 

@@ -10,3 +10,5 @@ models/*
 qdrant_storage/
 .DS_Store
 Thumbs.db
+# Local incoming datasets and runtime metadata DB
+data/

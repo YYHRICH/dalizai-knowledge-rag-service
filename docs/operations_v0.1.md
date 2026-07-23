@@ -21,7 +21,8 @@ RERANK_PROVIDER=dashscope
 RERANK_MODEL=qwen3-rerank
 RERANK_MODE=qa
 RERANK_TOP_N=10
-DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+DASHSCOPE_EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+DASHSCOPE_RERANK_BASE_URL=https://dashscope.aliyuncs.com/compatible-api/v1
 ```
 
 需要在 `.env` 中配置：
@@ -32,15 +33,23 @@ DASHSCOPE_API_KEY=CHANGE_ME_DASHSCOPE_API_KEY
 
 后续可扩展为本地模型、Jina、Cohere、OpenAI 或内部模型网关。
 
+## 知识源路线
+
+第一版使用当前仓库的 `knowledge/` 目录作为知识源。生产知识变多后，建议拆出独立知识仓库，并通过 `KNOWLEDGE_BASE_DIR` 指向外部目录。
+
+中后期建设知识维护平台时，数据库作为编辑、审核、版本和复核主库。RAG ingest 只读取已发布快照，Qdrant 只作为检索索引。
+
 ## Qdrant
 
-第一版使用固定 collection：
+第一版使用 alias 安全发布：
 
 ```text
-QDRANT_COLLECTION=dalizai_knowledge_v1
+QDRANT_COLLECTION_ALIAS=dalizai_knowledge_v1
+QDRANT_COLLECTION_PREFIX=dalizai_knowledge
+QDRANT_KEEP_COLLECTIONS=2
 ```
 
-每次 ingest 全量重建 collection。后续需要灰度和回滚时，再设计多 collection 或 alias 切换。
+每次 ingest 创建新的实际 collection，例如 `dalizai_knowledge_20260723_1030`。校验成功后，将 alias `dalizai_knowledge_v1` 切到新 collection。失败时不切 alias，旧版本继续可用。
 
 ## 健康检查
 

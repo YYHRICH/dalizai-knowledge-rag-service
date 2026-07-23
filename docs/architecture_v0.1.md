@@ -25,14 +25,15 @@ dalizai-agent-service
 - Vector DB: Qdrant
 - Embedding: DashScope `qwen3.7-text-embedding`, 1024 dimensions
 - Reranker: DashScope `qwen3-rerank`, qa mode
-- Knowledge source: Markdown
+- Knowledge source: Markdown + Git in v1
+- Knowledge roadmap: independent knowledge repo, then knowledge platform database
 - Ingestion: explicit full rebuild command in v1
 
 ## 第一版服务
 
 - `rag_service`: 对 Agent/MCP 提供 RAG 查询、管理查询、健康检查。
 - `model provider`: 第一版默认 DashScope 云 API，代码层保留 provider 抽象。
-- `qdrant`: 存储知识向量和 payload metadata。
+- `qdrant`: 存储知识向量和 payload metadata，仅作为检索索引，不作为知识主库。
 
 ## 知识治理
 
