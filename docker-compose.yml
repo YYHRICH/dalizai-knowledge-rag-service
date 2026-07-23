@@ -1,0 +1,37 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: dalizai-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+  rag-service:
+    build:
+      context: .
+      dockerfile: apps/rag_service/Dockerfile
+    profiles: ["app"]
+    env_file:
+      - .env
+    ports:
+      - "8100:8100"
+    depends_on:
+      - qdrant
+
+  # Optional local model service placeholder. First version defaults to DashScope cloud API.
+  model-service:
+    build:
+      context: .
+      dockerfile: apps/model_service/Dockerfile
+    profiles: ["model"]
+    env_file:
+      - .env
+    ports:
+      - "8200:8200"
+    volumes:
+      - ./models:/models
+
+volumes:
+  qdrant_storage:

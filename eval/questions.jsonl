@@ -1,0 +1,5 @@
+{"id":"eval_001","query":"怎么扫码充电？","businessDomains":["charging"],"knowledgeTypes":["faq","operation_guide"],"expectedKnowledgeId":"faq_charge_scan_001","expectedStatus":"success"}
+{"id":"eval_002","query":"优惠券能不能叠加使用？","businessDomains":["coupon"],"knowledgeTypes":["coupon_policy"],"expectedKnowledgeId":"coupon_stack_001","expectedStatus":"success"}
+{"id":"eval_003","query":"有没有火星充电优惠？","businessDomains":["coupon"],"knowledgeTypes":["coupon_policy"],"expectedKnowledgeId":null,"expectedStatus":"not_found"}
+{"id":"eval_004","query":"我这笔订单为什么扣了20块？","businessDomains":["payment"],"knowledgeTypes":["billing_policy","faq"],"expectedKnowledgeId":null,"expectedStatus":"not_found"}
+{"id":"eval_005","query":"查不到知识时怎么办？","businessDomains":["customer_service"],"knowledgeTypes":["handoff_guide"],"expectedKnowledgeId":"handoff_unanswerable_001","expectedStatus":"success"}
