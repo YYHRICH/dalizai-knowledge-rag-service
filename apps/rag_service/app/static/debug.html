@@ -108,6 +108,8 @@
           <input id="subIntent" placeholder="charge_scan_guide" />
         </div>
       </div>
+      <label>pageContext.page</label>
+      <input id="pageContextPage" placeholder="可选，例如：order_checkout" />
       <div class="row">
         <div>
           <label>topK</label>
@@ -172,6 +174,7 @@
       $('knowledgeTypes').value = item.knowledgeTypes.join(',');
       $('intent').value = item.intent || '';
       $('subIntent').value = item.subIntent || '';
+      $('pageContextPage').value = '';
       $('expectedStatus').value = item.expectedStatus || '';
       $('expectedKnowledgeId').value = item.expectedKnowledgeId || '';
       $('expectedContextIds').value = item.expectedContextIds.join(',');
@@ -206,6 +209,7 @@
           cityCode: null,
           stationId: null,
         },
+        context: $('pageContextPage').value.trim() ? { pageContext: { page: $('pageContextPage').value.trim() } } : {},
         expectedStatus: expectedStatus || null,
         expectedKnowledgeId: $('expectedKnowledgeId').value.trim() || null,
         expectedContextIds: splitList($('expectedContextIds').value),

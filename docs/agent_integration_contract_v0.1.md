@@ -309,3 +309,9 @@ http://127.0.0.1:8100/debug
 ```
 
 页面支持手动输入 query、选择 eval case，并明确展示原话、RAG 改写后的句子、召回知识、allowedClaims、forbiddenClaims、status、confidence 和评测对比。
+
+Docker 联调信息见：
+
+```text
+docs/agent_rag_docker_integration_v0.1.md
+```

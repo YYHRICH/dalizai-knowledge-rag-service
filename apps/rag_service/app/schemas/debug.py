@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -45,6 +45,7 @@ class DebugQueryRequest(BaseModel):
     subIntent: str | None = None
     topK: int | None = Field(default=5, ge=1)
     filters: RagFilters = Field(default_factory=RagFilters)
+    context: dict[str, Any] = Field(default_factory=dict)
     expectedStatus: str | None = None
     expectedKnowledgeId: str | None = None
     expectedContextIds: list[str] = Field(default_factory=list)

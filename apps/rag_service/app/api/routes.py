@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -126,16 +127,14 @@ def _cluster_response(row: dict) -> KnowledgeGapClusterResponse:
     )
 
 
-@router.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def _service_version() -> str:
+    try:
+        return version("dalizai-rag-service")
+    except PackageNotFoundError:
+        return "0.1.0"
 
 
-@router.get("/ready")
-def ready(
-    _: None = Depends(require_admin_api_key),
-    repository: MetadataRepository = Depends(get_metadata_repository),
-) -> dict[str, object]:
+def _readiness_status(repository: MetadataRepository) -> dict[str, object]:
     latest = repository.get_latest_successful_ingest_run()
     qdrant_status: dict[str, object]
     try:
@@ -155,9 +154,29 @@ def ready(
     ready_status = bool(latest) and qdrant_status["status"] == "ok"
     return {
         "status": "ready" if ready_status else "not_ready",
+        "service": "dalizai-rag-service",
+        "version": _service_version(),
         "latestIngest": latest,
         "qdrant": qdrant_status,
     }
+
+
+@router.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.get("/v1/health")
+def v1_health(repository: MetadataRepository = Depends(get_metadata_repository)) -> dict[str, object]:
+    return _readiness_status(repository)
+
+
+@router.get("/ready")
+def ready(
+    _: None = Depends(require_admin_api_key),
+    repository: MetadataRepository = Depends(get_metadata_repository),
+) -> dict[str, object]:
+    return _readiness_status(repository)
 
 
 @router.post("/v1/rag/query", response_model=RagQueryResponse)
@@ -246,7 +265,7 @@ def debug_query(
         subIntent=request.subIntent,
         topK=request.topK,
         filters=request.filters,
-        context={},
+        context=request.context,
     )
     response = RagQueryService(settings).query(rag_request)
     return DebugQueryResponse(

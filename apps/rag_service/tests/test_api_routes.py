@@ -12,6 +12,48 @@ def test_health() -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_v1_health_ready_checks_ingest_and_qdrant(monkeypatch, tmp_path) -> None:
+    from apps.rag_service.app.api import routes
+    from apps.rag_service.app.storage import MetadataRepository, SqliteDatabase
+    from apps.rag_service.app.storage.repository import IngestRunRecord, utc_now_iso
+
+    class FakeQdrantStore:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def count_points(self, collection_name):
+            assert collection_name == "dalizai_knowledge_v1"
+            return 24
+
+    db_url = f"sqlite:///{tmp_path / 'rag_service.db'}"
+    monkeypatch.setattr(routes.settings, "rag_metadata_db_url", db_url)
+    monkeypatch.setattr(routes, "QdrantKnowledgeStore", FakeQdrantStore)
+    repository = MetadataRepository(SqliteDatabase(db_url))
+    repository.initialize()
+    repository.create_ingest_run(
+        IngestRunRecord(
+            ingest_id="ingest_ready",
+            knowledge_version="kb_ready",
+            started_at=utc_now_iso(),
+            finished_at=utc_now_iso(),
+            status="success",
+            total_docs=12,
+            total_knowledge_items=24,
+            active_items=24,
+        )
+    )
+    client = TestClient(create_app())
+
+    response = client.get("/v1/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["service"] == "dalizai-rag-service"
+    assert body["version"]
+    assert body["qdrant"] == {"status": "ok", "pointCount": 24}
+
+
 def test_query_requires_auth() -> None:
     client = TestClient(create_app())
 
@@ -231,6 +273,7 @@ def test_debug_query_returns_response_and_evaluation(monkeypatch) -> None:
 
         def query(self, request):
             assert request.query == "怎么扫码充电？"
+            assert request.context == {"pageContext": {"page": "order_checkout"}}
             return RagQueryResponse(
                 requestId=request.requestId,
                 traceId=request.traceId,
@@ -265,6 +308,7 @@ def test_debug_query_returns_response_and_evaluation(monkeypatch) -> None:
             "traceId": "trace_debug_test_001",
             "query": "怎么扫码充电？",
             "filters": {"businessDomains": ["charging"], "knowledgeTypes": ["faq"]},
+            "context": {"pageContext": {"page": "order_checkout"}},
             "expectedStatus": "success",
             "expectedKnowledgeId": "faq_charge_scan_001",
             "expectedContextIds": ["faq_charge_scan_001#main"],
