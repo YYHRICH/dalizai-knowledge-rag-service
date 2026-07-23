@@ -10,6 +10,7 @@ class RagEvalCase:
     id: str
     query: str
     expected_status: str
+    should_call_rag: bool = True
     business_domains: list[str] = field(default_factory=list)
     knowledge_types: list[str] = field(default_factory=list)
     expected_context_ids: list[str] = field(default_factory=list)

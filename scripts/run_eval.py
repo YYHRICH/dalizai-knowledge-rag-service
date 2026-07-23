@@ -33,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON report path. Defaults to eval/reports/rag_eval_<timestamp>.json.",
     )
     parser.add_argument(
+        "--include-not-called",
+        action="store_true",
+        help="Include cases where shouldCallRag=false. Defaults to skip them for RAG retrieval eval.",
+    )
+    parser.add_argument(
         "--fail-under",
         type=float,
         default=0.75,
@@ -63,6 +68,11 @@ def main() -> int:
     else:
         cases = load_eval_cases_from_knowledge(PROJECT_ROOT / args.knowledge_dir)
         case_source = args.knowledge_dir
+    skipped_not_called = 0
+    if not args.include_not_called:
+        before = len(cases)
+        cases = [case for case in cases if case.should_call_rag and case.expected_status != "not_called"]
+        skipped_not_called = before - len(cases)
     if args.limit is not None:
         cases = cases[: args.limit]
     if not cases:
@@ -76,6 +86,7 @@ def main() -> int:
     write_json_report(report, output)
 
     print(f"caseSource={case_source}")
+    print(f"skippedNotCalled={skipped_not_called}")
     print(f"report={output}")
     print(format_summary(report))
     if report.summary.mean_score < args.fail_under:

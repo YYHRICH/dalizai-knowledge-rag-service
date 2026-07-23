@@ -206,3 +206,18 @@ rag_internal_error
 - 高风险知识必须参考 `forbiddenClaims`。
 - RAG 不返回订单金额、余额、退款进度、设备实时状态等业务真值。
 - `cards` 第一版保留字段，默认空数组，由 Agent/MCP adapter 决定是否展示。
+
+
+## 9. 联调资料
+
+Agent 侧调用时机、filters 推荐组合、返回结果消费规则见：
+
+```text
+docs/agent_integration_contract_v0.1.md
+```
+
+联调样例数据见：
+
+```text
+eval/agent_cases.jsonl
+```

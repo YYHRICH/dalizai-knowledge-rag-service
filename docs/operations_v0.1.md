@@ -137,6 +137,8 @@ rerank 文本包含 `title`、`summary`、`keywords`、`similarQuestions`、`con
 
 报告默认写入 `eval/reports/`，该目录为本地运行产物，不提交到 Git。
 
+RAG 检索评测默认跳过 `shouldCallRag=false` 或 `expectedStatus=not_called` 的 Agent 路由用例；这些用例应由 Agent 路由评测覆盖。
+
 ## 日志隐私
 
 - `userId`、`sessionId` 记录 hash。

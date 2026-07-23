@@ -14,6 +14,7 @@ def test_load_eval_cases_from_jsonl(tmp_path) -> None:
                 "knowledgeTypes": ["faq"],
                 "expectedKnowledgeId": "faq_charge_scan_001",
                 "expectedStatus": "success",
+                "shouldCallRag": True,
             },
             ensure_ascii=False,
         )
@@ -25,6 +26,7 @@ def test_load_eval_cases_from_jsonl(tmp_path) -> None:
 
     assert len(cases) == 1
     assert cases[0].expected_context_ids == ["faq_charge_scan_001#main"]
+    assert cases[0].should_call_rag is True
 
 
 def test_load_eval_cases_from_knowledge() -> None:

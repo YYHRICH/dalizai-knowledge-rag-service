@@ -61,3 +61,10 @@ docker compose up qdrant
 ```powershell
 .\.venv\Scripts\python scripts\run_eval.py --knowledge-dir knowledge --fail-under 0.75
 ```
+
+## 文档入口
+
+- [接口协议](docs/interface_v0.2.md)
+- [Agent 对接契约](docs/agent_integration_contract_v0.1.md)
+- [知识格式](docs/knowledge_format_v0.1.md)
+- [运维说明](docs/operations_v0.1.md)
