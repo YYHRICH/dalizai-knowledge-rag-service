@@ -1,318 +1,370 @@
-# 独立知识 RAG 服务设计汇报稿 v1.0
+# 独立知识 RAG 服务设计说明 v1.0
 
-## 1. 汇报摘要
+## 1. 文档定位
 
-### 1.1 一句话定位
+这份文档用于说明我们为什么要做一个独立的知识 RAG 服务，以及第一版知识库为什么采用 Markdown 维护、后续为什么要演进成知识维护平台。
 
-独立知识 RAG 服务是面向 Agent 的“知识依据召回层”：负责把用户问题映射到可追溯、可审计、可治理的业务知识，不直接生成最终对客回复。
+重点不是汇报当前开发进度，而是说明整体设计理念、知识格式、业务人员维护方式、时效性治理、平台化演进方向，以及 RAG 与 Agent 的职责边界。
+
+## 2. 核心设计理念
+
+### 2.1 RAG 是知识依据层，不是最终回复层
 
 ```mermaid
 flowchart LR
-    U[用户问题] --> A[Agent<br/>理解意图和上下文]
-    A --> R[RAG 服务<br/>召回知识依据]
-    R --> A
-    A --> Reply[Agent 组织最终回复]
+    User[用户问题] --> Agent[Agent<br/>理解意图/上下文/风险]
+    Agent --> RAG[RAG<br/>召回知识依据]
+    RAG --> Evidence[知识依据<br/>允许表达<br/>禁止表达<br/>来源]
+    Evidence --> Agent
+    Agent --> Reply[Agent<br/>组织最终对客回复]
 ```
 
-### 1.2 核心价值
+RAG 的职责是：
 
-| 主线 | 价值 |
+| RAG 做 | RAG 不做 |
 | --- | --- |
-| 业务价值 | 让 Agent 回答有依据，减少编造，降低高风险业务承诺 |
-| 工程架构 | 将知识检索从 Agent 主链路中拆出，独立维护、独立评测、独立迭代 |
-| 知识治理 | 从 Markdown 起步，逐步演进到业务人员可维护的知识平台 |
-| 效果评测 | 通过观测台、评测集、知识缺口和 badcase 闭环持续提升召回质量 |
+| 找到相关知识 | 不直接回复用户 |
+| 判断是否可回答 | 不查询订单、余额、退款进度、设备实时状态 |
+| 返回允许表达和禁止表达 | 不承诺赔偿、补券、退款等业务动作 |
+| 返回来源和版本 | 不替代业务 MCP |
+| 记录审计和知识缺口 | 不把低置信结果包装成确定答案 |
 
-### 1.3 当前设计原则
+这样设计的原因：
 
-| 原则 | 说明 |
-| --- | --- |
-| RAG 不直接回答用户 | RAG 返回知识依据、允许表达、禁止表达；最终话术由 Agent 生成 |
-| 业务真值不进 RAG | 订单金额、退款进度、设备实时状态等必须查业务 MCP |
-| 知识可追溯 | 每个结果返回知识 ID、片段 ID、来源文档、版本信息 |
-| 先可用，后平台化 | 第一版 Markdown + Git；中后期建设知识维护平台 |
-| 检索链路可观测 | 观测原话、改写结果、召回结果、置信度、命中来源 |
+- Agent 才掌握完整会话上下文和回复策略。
+- 业务实时数据必须来自业务系统或 MCP，不能由静态知识库猜测。
+- 高风险业务内容需要明确“哪些能说、哪些不能说”。
+- RAG 独立后，可以单独优化知识召回效果，而不影响 Agent 主流程。
 
-## 2. 项目背景与目标
-
-### 2.1 背景
-
-Agent 在处理业务问题时，会遇到两类信息：
-
-| 类型 | 示例 | 推荐来源 |
-| --- | --- | --- |
-| 静态知识 | 怎么扫码充电、优惠券规则、发票流程、转人工规则 | RAG 知识库 |
-| 实时业务真值 | 订单扣了多少钱、退款到哪了、这个桩是否可用 | 业务 MCP / 业务系统 |
-
-如果静态知识散落在 Agent prompt、代码 mock、业务文档或人工经验里，会带来几个问题：
-
-- 知识更新不统一。
-- Agent 容易编造或越权承诺。
-- 无法评测召回质量。
-- 无法知道哪些问题没知识覆盖。
-- 后续多个 Agent 复用成本高。
-
-### 2.2 建设目标
+### 2.2 知识是业务资产，不是代码附属品
 
 ```mermaid
-mindmap
-  root((独立知识 RAG))
-    稳定接口
-      Agent 统一调用
-      多 Agent 可复用
-    可信知识
-      允许表达
-      禁止表达
-      来源可追溯
-    持续优化
-      观测台
-      评测集
-      知识缺口
-    知识治理
-      Markdown 起步
-      平台化维护
-      版本和审核
+flowchart TB
+    Knowledge[业务知识] --> Owner[业务负责人]
+    Knowledge --> Version[版本]
+    Knowledge --> Review[复核]
+    Knowledge --> Audit[审计]
+    Knowledge --> Eval[评测]
+    Knowledge --> Publish[发布]
 ```
 
-### 2.3 非目标
+我们的设计不是把 FAQ 简单塞进向量库，而是把知识当成长期维护的业务资产。
 
-| 不做什么 | 原因 |
+因此每条知识都要能回答几个问题：
+
+| 问题 | 对应设计 |
 | --- | --- |
-| 不生成最终对客回复 | 最终回复需要结合 Agent 上下文、渠道风格和业务实时数据 |
-| 不查询实时业务数据 | RAG 知识库不是业务数据库，不能替代 MCP |
-| 第一版不做在线编辑接口 | 知识编辑需要审核、权限、版本、发布流程，不能简单暴露写接口 |
-| Qdrant 不作为知识主库 | Qdrant 是向量索引，主知识仍需有可治理的来源 |
+| 这条知识是谁负责的？ | `ownerTeam`、`owner` |
+| 什么时候开始生效？ | `effectiveFrom` |
+| 什么时候失效？ | `effectiveTo` |
+| 什么时候需要复核？ | `reviewDueAt` |
+| 属于哪个业务域？ | `businessDomain` |
+| 属于哪类知识？ | `knowledgeType` |
+| Agent 可以怎么说？ | `Allowed Claims` |
+| Agent 不能怎么说？ | `Forbidden Claims` |
+| 出问题能否追溯？ | `docId`、`knowledgeId`、`chunkId`、版本 |
 
-## 3. 职责边界
+### 2.3 先用 Markdown 起步，后续平台化维护
 
-### 3.1 Agent 与 RAG 分工
+```mermaid
+flowchart LR
+    M1[第一阶段<br/>Markdown + Git] --> M2[第二阶段<br/>独立知识仓库]
+    M2 --> M3[第三阶段<br/>知识维护平台]
+    M3 --> M4[发布快照]
+    M4 --> RAG[RAG 入库]
+```
+
+为什么第一版用 Markdown：
+
+| 原因 | 说明 |
+| --- | --- |
+| 启动快 | 不需要先开发完整后台，能尽快打通 RAG 链路 |
+| 可审计 | Git 可以看到谁改了什么、什么时候改的 |
+| 可回滚 | 知识改坏了可以回退版本 |
+| 格式清晰 | Markdown 对业务文档、FAQ、规则说明天然友好 |
+| 便于迁移 | 后续平台可以把表单字段导出成同样结构的 Markdown/JSON 快照 |
+
+但是 Markdown 不是最终形态。中后期我们会建设知识维护平台，让业务人员在 Web 页面填写字段、提交审核、发布知识，而不是长期直接编辑 Markdown。
+
+## 3. 整体架构
+
+### 3.1 系统关系
 
 ```mermaid
 flowchart TB
     subgraph AgentSide[Agent 侧]
-        A1[意图识别]
-        A2[子意图和槽位]
-        A3[页面上下文]
-        A4[风险等级]
-        A5[最终回复组织]
-        A6[业务 MCP 调用]
+        Agent[dalizai-agent-service]
+        MCP[faq_knowledge_mcp<br/>HTTP Adapter]
     end
 
-    subgraph RagSide[RAG 侧]
-        R1[Query Rewrite]
-        R2[向量召回]
-        R3[重排]
-        R4[置信度判断]
-        R5[知识依据返回]
-        R6[审计和缺口记录]
+    subgraph RagSide[RAG 服务]
+        API[FastAPI 接口]
+        Rewrite[Qwen Query Rewrite]
+        Retrieve[Qdrant 召回]
+        Rerank[Qwen Rerank]
+        Judge[置信度判断]
+        Audit[审计/缺口记录]
     end
 
-    AgentSide --> RagSide
-    RagSide --> AgentSide
+    subgraph KnowledgeSide[知识侧]
+        MD[Markdown 知识文件]
+        Ingest[入库任务]
+        Q[(Qdrant 向量索引)]
+        DB[(SQLite 元数据)]
+    end
+
+    Agent --> MCP --> API
+    API --> Rewrite --> Retrieve --> Rerank --> Judge --> API
+    Retrieve --> Q
+    API --> Audit --> DB
+    MD --> Ingest --> Q
+    Ingest --> DB
 ```
 
-### 3.2 RAG 返回什么
-
-| 返回内容 | 作用 |
-| --- | --- |
-| 命中状态 | 告诉 Agent 是否可以基于知识回答 |
-| 置信度 | 告诉 Agent 回答的可靠程度 |
-| 知识片段 | 给 Agent 组织回答时参考 |
-| 允许表达 | Agent 可直接采用的事实边界 |
-| 禁止表达 | 防止 Agent 承诺赔偿、绝对化结论或编造 |
-| 来源信息 | 支持审计、排查、知识追溯 |
-| 改写后的查询 | 用于观测和审计，不作为业务结论 |
-
-### 3.3 典型调用边界
+### 3.2 查询链路
 
 ```mermaid
-flowchart LR
-    Q1[怎么扫码充电] --> RAG[走 RAG]
-    Q2[优惠券为什么不能用] --> RAG
-    Q3[退款一般多久到账] --> RAG
-    Q4[我的退款到哪了] --> MCP[走退款 MCP]
-    Q5[这笔订单扣了多少钱] --> MCP[走订单 MCP]
-    Q6[这个桩现在能不能用] --> MCP[走充电平台 MCP]
+sequenceDiagram
+    participant Agent
+    participant RAG
+    participant Qwen as Qwen 改写
+    participant Emb as Embedding
+    participant Qdrant
+    participant Rerank
+
+    Agent->>RAG: 用户问题 + 意图 + filters + context
+    RAG->>Qwen: query rewrite
+    Qwen-->>RAG: 改写后的检索句
+    RAG->>Emb: 生成向量
+    Emb-->>RAG: query vector
+    RAG->>Qdrant: 向量召回 + 过滤
+    Qdrant-->>RAG: 候选知识
+    RAG->>Rerank: 重排
+    Rerank-->>RAG: 排序分数
+    RAG-->>Agent: 知识依据 + 置信度 + 来源
 ```
 
-## 4. 总体架构
-
-### 4.1 系统视图
+### 3.3 入库链路
 
 ```mermaid
 flowchart TB
-    User[用户] --> Agent[dalizai-agent-service]
-    Agent --> Adapter[faq_knowledge_mcp<br/>HTTP Adapter]
-    Adapter --> API[RAG API<br/>FastAPI]
-
-    API --> Rewrite[Qwen Query Rewrite]
-    Rewrite --> Embed[DashScope Embedding]
-    Embed --> Qdrant[(Qdrant<br/>向量索引)]
-    Qdrant --> Rerank[DashScope Rerank]
-    Rerank --> Judge[置信度判断]
-    Judge --> API
-
-    API --> Audit[(SQLite Metadata<br/>审计/缺口/入库记录)]
-    API --> Adapter
-    Adapter --> Agent
+    Edit[维护知识] --> Validate[字段校验]
+    Validate --> Parse[解析 Markdown]
+    Parse --> Active[过滤 active 和有效期]
+    Active --> Embed[生成知识向量]
+    Embed --> NewCollection[创建新 collection]
+    NewCollection --> Switch{校验通过?}
+    Switch -- 是 --> Alias[切换 Qdrant alias]
+    Switch -- 否 --> Keep[保留旧索引]
+    Alias --> Record[记录入库版本]
 ```
 
-### 4.2 模块拆分
+入库采用 alias 发布模式。RAG 查询固定访问稳定 alias，入库失败不会影响当前可用版本。
 
-| 模块 | 职责 |
+## 4. Markdown 知识格式设计
+
+### 4.1 目录组织
+
+第一版按业务域组织 Markdown 文件。一个 Markdown 文件是一组同业务域、同知识类型的知识集合；一个二级标题是一条知识。
+
+```text
+knowledge/
+  charging/
+    faq.md
+    operation_guide.md
+  coupon/
+    coupon_policy.md
+  refund/
+    refund_policy.md
+  invoice/
+    operation_guide.md
+  customer_service/
+    handoff_guide.md
+    risk_notice.md
+```
+
+这样设计的原因：
+
+| 设计 | 原因 |
 | --- | --- |
-| API 层 | 鉴权、请求校验、健康检查、调试接口、管理查询接口 |
-| Query Rewrite | 调用 Qwen 小模型，将口语问题改写成检索短句 |
-| Retriever | 调用 Qdrant 做向量召回和过滤 |
-| Reranker | 调用 Qwen rerank 模型重排候选知识 |
-| Ingestion | 解析 Markdown、校验知识、生成 embedding、发布索引 |
-| Metadata | 入库记录、审计日志、知识缺口、缺口聚类 |
-| Privacy | 用户 ID、会话 ID hash，query 脱敏 |
-| Debug Console | 给开发人员模拟查询、观察召回和改写结果 |
+| 按业务域分目录 | 方便业务负责人认领和维护 |
+| 按知识类型分文件 | FAQ、规则、故障排查的字段和风险不同 |
+| 一个文件多条知识 | FAQ 场景天然会有很多条问答，按文件聚合更易维护 |
+| 一条知识默认一个 chunk | 第一版知识较短，便于追溯和评测 |
 
-### 4.3 部署视图
+### 4.2 文档级字段
 
-```mermaid
-flowchart LR
-    subgraph DockerCompose[Docker Compose]
-        Rag[RAG Service<br/>:8100]
-        Q[(Qdrant<br/>:6333)]
-        DB[(SQLite<br/>/app/data)]
-    end
+每个 Markdown 文件顶部有一段 YAML Front Matter，描述这批知识的公共信息。
 
-    Rag --> Q
-    Rag --> DB
-    Rag --> Dash[DashScope 云 API]
-    Agent[Agent 服务] --> Rag
+```yaml
+---
+docId: doc_charging_faq_v1
+docTitle: 充电常见问题
+businessDomain: charging
+knowledgeType: faq
+riskLevel: low
+status: active
+ownerTeam: 用户运营
+owner: 张三
+effectiveFrom: 2026-07-23T00:00:00+08:00
+effectiveTo:
+updatedAt: 2026-07-23T00:00:00+08:00
+reviewDueAt: 2026-10-23T00:00:00+08:00
+channels:
+  - wechat_mini_program
+cityCodes:
+stationIds:
+---
 ```
 
-## 5. 技术选型说明
+字段设计说明：
 
-### 5.1 选型总览
-
-| 能力 | 第一版选型 | 选择原因 |
+| 字段 | 业务含义 | 为什么需要 |
 | --- | --- | --- |
-| API 框架 | FastAPI | 类型清晰、接口开发快、适合服务化 |
-| 向量库 | Qdrant | 部署简单、过滤能力成熟、适合独立 RAG 服务 |
-| Embedding | DashScope Qwen embedding | 免本地 GPU、中文能力好、接入成本低 |
-| Rerank | DashScope Qwen rerank | 提高 FAQ/规则类知识排序准确性 |
-| Query Rewrite | DashScope Qwen 小模型 | 利用 Agent 上下文把口语问题转成业务检索短句 |
-| 知识源 | Markdown + Git | 第一版成本低、可审计、可回滚、方便业务样本沉淀 |
-| 元数据 | SQLite | 第一版轻量可用，保存审计、缺口、入库记录 |
-| 部署 | Docker Compose | 本地联调和小规模环境启动简单 |
+| `docId` | 文档唯一 ID | 便于版本、审计和问题追溯 |
+| `docTitle` | 文档名称 | 方便业务人员识别知识集合 |
+| `businessDomain` | 业务域 | 检索过滤，避免跨域误召回 |
+| `knowledgeType` | 知识类型 | 支持不同知识使用不同阈值和策略 |
+| `riskLevel` | 风险等级 | 高风险知识需要更严格的 forbiddenClaims 和审核 |
+| `status` | 知识状态 | 只有 active 参与检索 |
+| `ownerTeam` | 负责团队 | 过期复核、知识缺口分派时使用 |
+| `owner` | 负责人 | 后续平台提醒到人 |
+| `effectiveFrom` | 生效时间 | 防止提前召回未生效规则 |
+| `effectiveTo` | 失效时间 | 防止过期活动或旧规则继续生效 |
+| `updatedAt` | 更新时间 | 便于判断知识新旧 |
+| `reviewDueAt` | 复核时间 | 到期提醒业务人员确认知识是否仍有效 |
+| `channels` | 适用渠道 | 区分小程序、App、客服后台等不同渠道规则 |
+| `cityCodes` | 适用城市 | 支持城市差异化规则 |
+| `stationIds` | 适用站点 | 支持站点差异化规则 |
 
-### 5.2 为什么选 Qdrant
+### 4.3 知识条目格式
 
-```mermaid
-flowchart TB
-    Need[独立 RAG 需要] --> V[向量检索]
-    Need --> F[业务域/类型过滤]
-    Need --> A[版本 alias 切换]
-    Need --> D[本地 Docker 易部署]
+一个二级标题是一条知识：
 
-    V --> Q[Qdrant]
-    F --> Q
-    A --> Q
-    D --> Q
+```markdown
+## faq_charge_scan_001｜怎么扫码充电？
+
+### Summary
+用户连接充电枪后，可以通过小程序扫码启动充电。
+
+### Content
+用户连接充电枪后，可在小程序首页点击扫码充电，扫描设备二维码并确认启动。余额不足或设备不可用时，系统会在启动前提示。
+
+### Allowed Claims
+- 用户连接充电枪后，可以在小程序中扫码启动充电。
+- 余额不足或设备不可用时，系统会在启动前提示。
+
+### Forbidden Claims
+- 一定可以启动成功。
+- 可以绕过余额校验启动。
+
+### Keywords
+- 扫码
+- 二维码
+- 启动充电
+
+### Similar Questions
+- 扫哪里充电？
+- 怎么扫二维码启动？
+- 不会扫码充电怎么办？
+
+### Eval Questions
+[
+  {
+    "question": "怎么扫码充电？",
+    "referenceAnswer": "用户连接充电枪后，可以在小程序中扫码启动充电。余额不足或设备不可用时，系统会在启动前提示。",
+    "expectedContextIds": ["faq_charge_scan_001#main"],
+    "expectedStatus": "success",
+    "expectedClaims": [
+      "用户连接充电枪后，可以在小程序中扫码启动充电。",
+      "余额不足或设备不可用时，系统会在启动前提示。"
+    ],
+    "negativeContextIds": [],
+    "notes": "扫码充电核心 FAQ。"
+  }
+]
 ```
 
-要点：
+条目字段说明：
 
-- 支持向量检索 + payload filter，适合按业务域、知识类型、渠道过滤。
-- 支持 collection 和 alias，适合入库后切换版本。
-- Docker 启动简单，联调成本低。
-- Qdrant 只作为检索索引，不承担知识主库职责。
+| 字段 | 是否必填 | 作用 |
+| --- | --- | --- |
+| `knowledgeId` | 是 | 知识全局唯一 ID，来自二级标题左侧 |
+| 标题 | 是 | 面向业务人员和检索排序都很重要 |
+| `Summary` | 是 | 知识摘要，方便 Agent 和观测台快速判断 |
+| `Content` | 是 | 知识正文，提供完整依据 |
+| `Allowed Claims` | 是 | Agent 可以安全表达的内容 |
+| `Forbidden Claims` | 高风险必填 | Agent 不能承诺或不能判断的内容 |
+| `Keywords` | 可选 | 增强召回效果 |
+| `Similar Questions` | 可选 | 覆盖用户常见口语问法 |
+| `Eval Questions` | 模拟/评测建议填 | 用于后续 RAGAS 类评测，不进入正式召回内容 |
 
-### 5.3 为什么用云模型
-
-| 考虑 | 说明 |
-| --- | --- |
-| 本地环境 | 当前不依赖本机 GPU，降低启动门槛 |
-| 中文效果 | Qwen 系列对中文业务问法和规则文本友好 |
-| 研发效率 | 第一版先验证 RAG 链路和治理闭环 |
-| 后续可替换 | provider 层抽象，后续可接本地模型或内部模型网关 |
-
-### 5.4 为什么不让 RAG 直接生成回复
+### 4.4 为什么要有 Allowed Claims 和 Forbidden Claims
 
 ```mermaid
 flowchart LR
-    RAG[RAG] --> Facts[知识依据]
-    RAG --> Claims[允许/禁止表达]
-    Facts --> Agent[Agent]
-    Claims --> Agent
-    Biz[业务 MCP 实时数据] --> Agent
+    Content[知识正文] --> Agent[Agent]
+    Allow[Allowed Claims] --> Agent
+    Forbid[Forbidden Claims] --> Guard[安全边界]
+    Guard --> Agent
     Agent --> Reply[最终回复]
 ```
 
-原因：
+只给正文是不够的，因为 Agent 可能在组织语言时做过度推断。
 
-- 回复需要结合实时业务数据，RAG 不掌握订单、账户、设备状态。
-- 回复需要遵守 Agent 的对话策略、渠道语气、上下文记忆。
-- RAG 直接生成话术会模糊责任边界，增加错误承诺风险。
+例如卡券问题：
 
-### 5.5 为什么第一版不用 MySQL
+| 类型 | 示例 |
+| --- | --- |
+| 允许表达 | 卡券未展示可能与有效期、适用站点、订单门槛、活动限制有关 |
+| 禁止表达 | 承诺用户一定可以使用该卡券 |
+| 禁止表达 | 承诺补发卡券或赔偿 |
 
-| 阶段 | 存储策略 | 原因 |
-| --- | --- | --- |
-| 第一版 | Markdown + SQLite + Qdrant | 快速搭建、方便本地联调、治理链路先跑通 |
-| 中期 | 独立知识仓库 + 发布快照 | 知识和代码解耦，便于业务协作 |
-| 后期 | 知识平台 + 数据库主库 | 支持权限、审核、版本、发布、复核、操作日志 |
+这能把“知识依据”和“表达边界”拆开，降低高风险业务场景下的错误承诺。
 
-## 6. 知识数据设计
-
-### 6.1 第一版知识组织
+### 4.5 哪些字段参与检索
 
 ```mermaid
 flowchart TB
-    KB[knowledge 目录] --> Domain1[充电]
-    KB --> Domain2[卡券]
-    KB --> Domain3[退款]
-    KB --> Domain4[发票]
-    KB --> Domain5[设备/站点/支付/账户/订单/客服]
-
-    Domain1 --> File1[常见问题 Markdown]
-    Domain1 --> File2[操作指引 Markdown]
-    Domain2 --> File3[规则政策 Markdown]
-
-    File1 --> Item1[一条知识]
-    Item1 --> Chunk[默认一个 chunk]
+    Title[标题] --> Embedding[Embedding 文本]
+    Summary[摘要] --> Embedding
+    Content[正文] --> Embedding
+    Keywords[关键词] --> Embedding
+    Similar[相似问法] --> Embedding
+    Allow[允许表达] --> Embedding
+    Forbid[禁止表达] --> ReturnOnly[只返回给 Agent<br/>不参与 embedding]
 ```
 
-### 6.2 业务域与知识类型设计理念
+设计原因：
 
-| 维度 | 设计理念 |
-| --- | --- |
-| 业务域 | 第一版覆盖充电、卡券、退款、发票、设备、站点、支付、账户、订单、客服等常见业务域 |
-| 知识类型 | 第一版覆盖常见问题、操作指引、规则政策、故障排查、转人工和风险提示等 |
-| 组合关系 | 第一版不强制限制组合，只给推荐组合，避免过早锁死业务扩展 |
-| 中文维护 | 业务人员在平台上看到中文名称，底层再映射为系统字段 |
-| 可扩展 | 后续通过配置化枚举维护，不把业务枚举写死在代码里 |
+- 标题、摘要、正文、关键词、相似问法能提升召回。
+- Allowed Claims 参与检索，是因为它代表可回答事实。
+- Forbidden Claims 不参与 embedding，避免“禁止内容”反而提升相关性；它只作为安全边界返回给 Agent。
 
-### 6.3 知识条目结构
+## 5. 时效性与版本治理
+
+### 5.1 生效、失效、复核三件事分开
 
 ```mermaid
 flowchart LR
-    Item[知识条目] --> Title[标题]
-    Item --> Summary[摘要]
-    Item --> Content[正文]
-    Item --> Allow[允许表达]
-    Item --> Forbid[禁止表达]
-    Item --> Keywords[关键词]
-    Item --> Similar[相似问法]
-    Item --> Eval[评测问题]
+    EffectiveFrom[生效时间] --> Search[允许参与检索]
+    EffectiveTo[失效时间] --> Stop[到期后不再检索]
+    ReviewDueAt[复核时间] --> Remind[提醒业务复核]
 ```
 
-| 字段 | 用途 |
-| --- | --- |
-| 标题 | 用于召回、展示、追溯 |
-| 摘要 | 帮助 Agent 快速理解知识内容 |
-| 正文 | 作为回答组织参考 |
-| 允许表达 | Agent 可安全使用的事实边界 |
-| 禁止表达 | 防止绝对化、赔偿承诺、越权判断 |
-| 关键词/相似问法 | 提高 embedding 和 rerank 命中率 |
-| 评测问题 | 用于构造评测集，不进入正式对客知识 |
+| 字段 | 是否影响检索 | 设计目的 |
+| --- | --- | --- |
+| `effectiveFrom` | 是 | 防止未生效活动、规则提前被召回 |
+| `effectiveTo` | 是 | 防止过期活动、旧规则继续被召回 |
+| `reviewDueAt` | 否 | 不直接停用知识，只提醒业务人员复核 |
 
-### 6.4 生命周期状态
+为什么 `reviewDueAt` 不直接让知识失效：
+
+- 很多规则虽然到复核时间，但可能仍然有效。
+- 自动下线可能造成 Agent 找不到本来正确的知识。
+- 更合理的方式是提醒负责人复核，由业务确认继续有效、修改或下线。
+
+### 5.2 知识状态流转
 
 ```mermaid
 stateDiagram-v2
@@ -328,403 +380,411 @@ stateDiagram-v2
     已过期 --> 已归档
 ```
 
-第一版只检索“已发布且在有效期内”的知识。旧知识不建议物理删除，优先停用、过期或归档，保留审计追溯能力。
+第一版状态通过 Markdown 字段维护：
 
-## 7. 知识治理与平台化演进
+| 状态 | 是否入库 | 说明 |
+| --- | --- | --- |
+| 草稿 | 否 | 未完成内容，不参与检索 |
+| 待审核 | 否 | 等待业务或负责人确认 |
+| 已发布 | 是 | 可参与检索 |
+| 已停用 | 否 | 人工下线，不再召回 |
+| 已过期 | 否 | 超过失效时间，不再召回 |
+| 已归档 | 否 | 保留历史记录 |
 
-### 7.1 总体理念
+### 5.3 不建议物理删除旧知识
+
+旧知识优先采用“停用、过期、归档”，而不是直接删除。
+
+原因：
+
+- 可以追溯历史版本。
+- 可以解释某段时间内 Agent 为什么这么回答。
+- 可以支持回滚。
+- 可以对比新旧知识对召回效果的影响。
+
+## 6. 业务人员如何维护知识
+
+### 6.1 第一阶段：业务给内容，研发协助入库
 
 ```mermaid
 flowchart LR
-    M1[Markdown + Git<br/>快速启动] --> M2[独立知识仓库<br/>知识代码解耦]
-    M2 --> M3[知识维护平台<br/>业务人员维护]
-    M3 --> M4[发布快照<br/>稳定入库]
-    M4 --> Q[(Qdrant 索引)]
+    Biz[业务人员整理内容] --> MD[按模板形成 Markdown]
+    MD --> Review[业务负责人确认]
+    Review --> Git[提交到仓库]
+    Git --> Ingest[执行入库]
+    Ingest --> Debug[观测台验证]
 ```
 
-### 7.2 为什么后续需要知识平台
+第一版业务人员可以不直接接触所有技术细节，但需要按模板提供：
 
-| 当前痛点 | 平台能力 |
+| 需要业务提供 | 示例 |
 | --- | --- |
-| 业务人员不适合长期直接改 Markdown | 表单化编辑，中文字段，模板引导 |
-| 知识质量依赖人工约定 | 必填校验、格式校验、风险字段校验 |
-| 高风险知识需要审核 | 审批流、发布权限、操作日志 |
-| 知识过期不易发现 | 复核任务、到期提醒、负责人机制 |
-| 难以沉淀 badcase | 知识缺口聚类、补知识工单、评测回归 |
-| 发布风险不可控 | 版本管理、灰度发布、回滚 |
+| 这条知识讲什么 | 怎么扫码充电 |
+| 用户常见问法 | 扫哪里充电、不会扫码怎么办 |
+| 可以对用户说什么 | 连接充电枪后可在小程序扫码启动 |
+| 不能对用户承诺什么 | 不能承诺一定启动成功 |
+| 生效和失效时间 | 活动规则、卡券规则特别需要 |
+| 负责人和复核时间 | 后续过期提醒和缺口分派使用 |
 
-### 7.3 平台职责边界
+### 6.2 第二阶段：独立知识仓库
+
+当知识越来越多，建议拆出独立知识仓库：
+
+```text
+dalizai-knowledge-base/
+  knowledge/
+  eval/
+  publish/
+```
+
+这样做的好处：
+
+- RAG 服务代码和业务知识分离。
+- 业务知识可以有独立审批和发布节奏。
+- 不需要每次改知识都改服务代码。
+- 可以针对知识仓库做更细粒度权限控制。
+
+### 6.3 第三阶段：知识维护平台
+
+长期来看，业务人员不应该直接写 Markdown，而应该在 Web 平台上维护知识。
 
 ```mermaid
 flowchart TB
-    subgraph 编辑态
-        Draft[草稿]
-        Review[审核]
-        Owner[负责人/团队]
-        Task[复核任务]
-    end
-
-    subgraph 发布态
-        Snapshot[发布快照]
-        Version[知识版本]
-        Report[发布报告]
-    end
-
-    subgraph 检索态
-        Ingest[入库任务]
-        Vector[向量索引]
-        RAG[RAG 查询]
-    end
-
-    编辑态 --> 发布态 --> 检索态
+    Biz[业务人员] --> Web[知识维护平台]
+    Web --> Form[表单字段]
+    Form --> Validate[自动校验]
+    Validate --> Review[提交审核]
+    Review --> Publish[发布版本]
+    Publish --> Snapshot[生成发布快照<br/>Markdown 或 JSON]
+    Snapshot --> Ingest[RAG 入库]
 ```
 
-平台负责编辑、审核、版本和发布；RAG 只读取已发布知识，不直接读取编辑中的草稿。
+平台不是简单的“编辑器”，而是知识治理系统。
 
-## 8. 检索链路设计
+## 7. 知识维护平台设计
 
-### 8.1 查询主链路
+### 7.1 平台核心页面
 
 ```mermaid
-sequenceDiagram
-    participant Agent
-    participant RAG
-    participant Qwen as Qwen Query Rewrite
-    participant Emb as Embedding
-    participant Qdrant
-    participant Rerank
-    participant Audit as 审计/缺口库
-
-    Agent->>RAG: POST /v1/rag/query
-    RAG->>RAG: 鉴权 + schema 校验
-    RAG->>Qwen: 原话 + hint + 意图 + filters + context
-    Qwen-->>RAG: queryRewrite
-    RAG->>Emb: queryRewrite 向量化
-    Emb-->>RAG: query vector
-    RAG->>Qdrant: 向量召回 + 业务过滤
-    Qdrant-->>RAG: topN 候选知识
-    RAG->>Rerank: queryRewrite + 候选文本
-    Rerank-->>RAG: 重排分数
-    RAG->>RAG: 阈值判断
-    RAG->>Audit: 记录审计，必要时记录知识缺口
-    RAG-->>Agent: 结构化知识结果
+flowchart TB
+    Platform[知识维护平台] --> List[知识列表]
+    Platform --> Edit[知识编辑页]
+    Platform --> Review[审核页]
+    Platform --> Version[版本记录]
+    Platform --> Gap[知识缺口页]
+    Platform --> Eval[评测结果页]
+    Platform --> Publish[发布管理]
 ```
 
-### 8.2 Query Rewrite 策略
+| 页面 | 主要功能 |
+| --- | --- |
+| 知识列表 | 按业务域、知识类型、状态、负责人、复核时间筛选 |
+| 知识编辑页 | 表单化维护 Markdown 中的所有字段 |
+| 审核页 | 高风险知识、规则政策、活动内容发布前审核 |
+| 版本记录 | 查看每次修改差异，支持回滚 |
+| 知识缺口页 | 查看未命中/低置信聚类，转成补知识任务 |
+| 评测结果页 | 查看每次发布前后的召回效果变化 |
+| 发布管理 | 生成发布快照，触发 RAG 入库和 alias 切换 |
 
-当前选择：**单次 Qwen 语义归一化 + 多短句扩展**。
+### 7.2 Markdown 字段如何映射到 Web 表单
 
 ```mermaid
 flowchart LR
-    Raw[用户原话] --> LLM[Qwen 小模型]
-    Hint[Agent hint] --> LLM
-    Intent[意图/子意图] --> LLM
-    Filter[业务域/知识类型] --> LLM
-    Page[页面上下文] --> LLM
-    LLM --> Rewrite[2-4 个检索短句]
+    Form[Web 表单] --> YAML[YAML Front Matter]
+    Form --> Sections[Markdown 小节]
+    YAML --> Snapshot[发布快照]
+    Sections --> Snapshot
+    Snapshot --> RAG[RAG 入库]
 ```
 
-策略说明：
-
-| 设计点 | 说明 |
+| Web 表单项 | 对应 Markdown 字段 |
 | --- | --- |
-| RAG 侧负责最终改写 | 改写直接影响召回，应和切片、索引、rerank 一起优化 |
-| Agent hint 只作信号 | Agent 可以传归一化提示，但不替代 RAG 的最终改写 |
-| 多短句输出 | 同时覆盖口语表达、业务标准表达、FAQ 标题表达和页面上下文 |
-| JSON 输出 | 控制模型输出格式，降低解析不确定性 |
-| 失败兜底 | 模型异常或 JSON 无效时退回原 query，保证服务可用 |
+| 文档 ID | `docId` |
+| 文档标题 | `docTitle` |
+| 业务域 | `businessDomain` |
+| 知识类型 | `knowledgeType` |
+| 风险等级 | `riskLevel` |
+| 状态 | `status` |
+| 负责团队 | `ownerTeam` |
+| 负责人 | `owner` |
+| 生效时间 | `effectiveFrom` |
+| 失效时间 | `effectiveTo` |
+| 更新时间 | `updatedAt` |
+| 复核时间 | `reviewDueAt` |
+| 适用渠道 | `channels` |
+| 适用城市 | `cityCodes` |
+| 适用站点 | `stationIds` |
+| 知识标题 | 二级标题中的标题部分 |
+| 知识 ID | 二级标题中的 `knowledgeId` |
+| 摘要 | `Summary` |
+| 正文 | `Content` |
+| 允许表达 | `Allowed Claims` |
+| 禁止表达 | `Forbidden Claims` |
+| 关键词 | `Keywords` |
+| 相似问法 | `Similar Questions` |
+| 评测问题 | `Eval Questions` |
+
+也就是说，Markdown 不是和平台冲突的方案。Markdown 是第一版的知识载体，也可以成为后续平台的导入导出格式或发布快照格式。
+
+### 7.3 编辑页草图
+
+```mermaid
+flowchart TB
+    Edit[知识编辑页] --> Basic[基础信息<br/>标题/业务域/知识类型/风险等级]
+    Edit --> Scope[适用范围<br/>渠道/城市/站点]
+    Edit --> Time[时效信息<br/>生效/失效/复核]
+    Edit --> Body[知识内容<br/>摘要/正文]
+    Edit --> Claims[表达边界<br/>允许表达/禁止表达]
+    Edit --> Recall[召回增强<br/>关键词/相似问法]
+    Edit --> Eval[评测问题<br/>标准答案/期望命中]
+    Edit --> Actions[保存草稿/提交审核/发布]
+```
+
+### 7.4 平台校验规则
+
+| 校验类型 | 示例 |
+| --- | --- |
+| 必填校验 | 标题、正文、允许表达、生效时间、复核时间不能为空 |
+| 唯一性校验 | `knowledgeId` 全局唯一 |
+| 风险校验 | 高风险知识必须填写禁止表达 |
+| 时效校验 | 失效时间不能早于生效时间 |
+| 内容校验 | 禁止表达不能和允许表达互相冲突 |
+| 范围校验 | 站点级知识必须填写站点范围 |
+| 评测校验 | 发布前至少有一个可回归的问题 |
+
+### 7.5 平台审批流
+
+```mermaid
+flowchart LR
+    Draft[保存草稿] --> Submit[提交审核]
+    Submit --> Review{审核通过?}
+    Review -- 否 --> Back[退回修改]
+    Review -- 是 --> Publish[发布]
+    Publish --> Snapshot[生成发布快照]
+    Snapshot --> Ingest[触发 RAG 入库]
+    Ingest --> Online[线上可检索]
+```
+
+审批规则建议：
+
+| 知识类型 | 审批建议 |
+| --- | --- |
+| 普通 FAQ | 业务负责人审核 |
+| 操作指引 | 业务负责人或产品审核 |
+| 卡券、退款、计费规则 | 业务负责人 + 风控/财务相关方审核 |
+| 赔偿、投诉、风险提示 | 客服负责人 + 法务/风控审核 |
+
+### 7.6 复核提醒机制
+
+```mermaid
+flowchart TB
+    Due[到达 reviewDueAt] --> Task[生成复核任务]
+    Task --> Owner[提醒负责人]
+    Owner --> Decision{是否仍有效?}
+    Decision -- 是 --> Extend[更新 reviewDueAt]
+    Decision -- 否 --> Edit[修改/停用/归档]
+    Edit --> Publish[重新发布]
+```
+
+复核提醒不等于自动删除旧知识。平台只提醒业务人员处理，由业务确认继续有效、修改、停用或归档。
+
+## 8. 检索策略设计
+
+### 8.1 Query Rewrite 策略
+
+当前采用：**单次 Qwen 语义归一化 + 多短句扩展**。
+
+```mermaid
+flowchart LR
+    Raw[用户原话] --> Qwen[Qwen 小模型]
+    Hint[Agent hint] --> Qwen
+    Intent[意图/子意图] --> Qwen
+    Filter[业务域/知识类型] --> Qwen
+    Context[页面上下文] --> Qwen
+    Qwen --> Rewrite[改写后的 2-4 个检索短句]
+```
 
 示例：
 
 ```text
-原话：这个券咋用不了
+用户原话：这个券咋用不了
 Agent hint：卡券无法使用原因
-页面：订单结算页
-RAG queryRewrite：卡券无法使用原因；这个券咋用不了；订单结算页未展示卡券；卡券使用规则
+页面上下文：订单结算页
+RAG 改写：卡券无法使用原因；这个券咋用不了；订单结算页未展示卡券；卡券使用规则
 ```
 
-### 8.3 召回与重排
+为什么改写放在 RAG 侧：
+
+- 改写直接影响召回效果。
+- 改写需要理解知识库结构、标题风格、关键词、相似问法。
+- RAG 侧可以根据 badcase 统一优化 rewrite、切片、索引和 rerank。
+- Agent 侧可以提供 hint，但不应该强行替代 RAG 的最终改写。
+
+### 8.2 召回、重排和阈值
 
 ```mermaid
 flowchart TB
-    Rewrite[queryRewrite] --> Embedding[生成查询向量]
-    Embedding --> Recall[Qdrant topN 召回]
-    Recall --> Filter[业务域/知识类型/渠道/有效期过滤]
-    Filter --> Rerank[Qwen rerank 重排]
-    Rerank --> TopK[返回 topK]
-    TopK --> Judge[置信度状态判断]
+    Rewrite[queryRewrite] --> Emb[Embedding]
+    Emb --> Qdrant[Qdrant 召回]
+    Qdrant --> Filter[业务过滤/有效期过滤]
+    Filter --> Rerank[Rerank 重排]
+    Rerank --> Score[置信度]
+    Score --> Status[success / low_confidence / not_found]
 ```
 
-| 步骤 | 目的 |
-| --- | --- |
-| 向量召回 | 先找语义相近候选知识 |
-| 业务过滤 | 避免跨域误召回 |
-| rerank | 让候选排序更贴近当前问题 |
-| 阈值判断 | 控制是否允许 Agent 基于知识回答 |
-
-### 8.4 状态判断
-
-```mermaid
-flowchart LR
-    Score[最高置信度] --> A{是否大于成功阈值}
-    A -- 是 --> Success[success<br/>可回答]
-    A -- 否 --> B{是否大于低置信阈值}
-    B -- 是 --> Low[low_confidence<br/>谨慎处理]
-    B -- 否 --> NotFound[not_found<br/>不编造]
-```
-
-| 状态 | Agent 建议动作 |
-| --- | --- |
-| success | 基于 allowedClaims 组织回复 |
-| low_confidence | 澄清、谨慎回答或转人工 |
-| not_found | 不编造，澄清、转人工或改调业务 MCP |
-| error | 安全兜底，可按 retryable 短重试 |
-
-## 9. Agent 接口协议概述
-
-### 9.1 调用方式
-
-```mermaid
-flowchart LR
-    Agent[Agent] --> MCP[faq_knowledge_mcp]
-    MCP --> RAG[POST /v1/rag/query]
-    RAG --> MCP
-    MCP --> Agent
-```
-
-接口概述：
-
-| 项 | 说明 |
-| --- | --- |
-| 路径 | `POST /v1/rag/query` |
-| 鉴权 | `Authorization: Bearer RAG_SERVICE_API_KEY` |
-| Agent 传入 | 用户问题、意图、上下文、过滤条件、topK |
-| RAG 返回 | 命中状态、置信度、知识依据、允许表达、禁止表达、来源信息 |
-| 详细字段 | 以接口协议文档为准 |
-
-### 9.2 Health Check
-
-| 接口 | 用途 | 鉴权 |
+| 状态 | 含义 | Agent 动作 |
 | --- | --- | --- |
-| `/health` | 容器进程探活 | 无 |
-| `/v1/health` | Agent 联调 readiness | 无 |
-| `/ready` | 管理员 readiness 详情 | Admin Key |
+| `success` | 命中且可回答 | 基于 allowedClaims 组织回复 |
+| `low_confidence` | 有候选但不够确定 | 谨慎回答、澄清或转人工 |
+| `not_found` | 未找到可信知识 | 不编造，澄清、转人工或改调业务 MCP |
+| `error` | 服务或依赖异常 | 安全兜底，可短重试 |
 
-`/v1/health.status=ready` 表示已有成功入库记录，且 Qdrant alias 可查询。
+## 9. 观测、评测和知识缺口
 
-## 10. 入库与发布设计
+### 9.1 开发观测台
 
-### 10.1 入库流程
-
-```mermaid
-flowchart TB
-    Edit[修改 Markdown] --> Validate[格式和必填校验]
-    Validate --> Parse[解析知识条目]
-    Parse --> Filter[过滤未发布/未生效知识]
-    Filter --> Embed[生成 embedding]
-    Embed --> Build[创建新 Qdrant collection]
-    Build --> Alias[切换 alias]
-    Alias --> Report[写入入库报告]
-```
-
-### 10.2 Alias 安全发布
-
-```mermaid
-flowchart LR
-    Old[旧 collection] --> Alias[dalizai_knowledge_v1]
-    New[新 collection 构建中]
-    New --> Check{校验通过?}
-    Check -- 是 --> Switch[alias 切到新 collection]
-    Check -- 否 --> Keep[保留旧 alias 不变]
-```
-
-设计效果：
-
-- 入库失败不影响线上查询。
-- 查询服务始终访问稳定 alias。
-- 支持保留最近版本，便于回滚。
-
-## 11. 观测与评测设计
-
-### 11.1 开发观测台
+观测台用于研发和 Agent 联调，不是业务人员维护平台。
 
 ```mermaid
 flowchart TB
-    Input[输入原话/query/hint/filter/context] --> Run[运行查询]
-    Run --> Observe[观察结果]
-    Observe --> O1[原话]
-    Observe --> O2[改写后的句子]
-    Observe --> O3[命中知识]
-    Observe --> O4[置信度]
-    Observe --> O5[允许/禁止表达]
-    Observe --> O6[原始 JSON]
+    Console[观测台] --> Input[模拟用户输入]
+    Console --> Rewrite[查看原话和改写句]
+    Console --> Recall[查看召回知识]
+    Console --> Claims[查看允许/禁止表达]
+    Console --> Score[查看置信度]
+    Console --> Raw[查看原始响应]
 ```
 
-观测台定位：开发联调和效果调试，不作为业务人员知识维护平台。
+观测台最关键的价值是能看清：
 
-### 11.2 评测闭环
+```text
+用户到底问了什么
+RAG 改写成了什么
+召回了哪些知识
+为什么是 success / low_confidence / not_found
+```
+
+### 9.2 评测闭环
 
 ```mermaid
 flowchart LR
-    Case[评测问题] --> Run[批量评测]
-    Run --> Metric[指标统计]
-    Metric --> Badcase[Badcase 分析]
-    Badcase --> Improve[优化知识/query rewrite/rerank/阈值]
-    Improve --> Case
+    Eval[评测问题] --> Run[批量评测]
+    Run --> Metrics[召回/精确/相关/忠实]
+    Metrics --> Badcase[Badcase]
+    Badcase --> Improve[改知识/改 rewrite/调阈值]
+    Improve --> Eval
 ```
 
-评测关注：
+后续会参考 RAGAS 的四类指标：
 
-| 指标方向 | 说明 |
+| 指标方向 | 关注点 |
 | --- | --- |
-| 上下文召回 | 是否召回了期望知识片段 |
-| 上下文精确 | 返回结果里噪声是否过多 |
-| 回答相关性代理 | 召回内容是否和问题相关 |
-| 忠实性代理 | allowedClaims 是否能支撑 Agent 回复 |
+| Faithfulness | Agent 回复是否忠实于召回上下文 |
+| Response Relevancy | 回复是否回应用户问题 |
+| Context Precision | 召回结果是否少噪声、排序是否靠前 |
+| Context Recall | 是否召回了回答所需的关键知识 |
 
-### 11.3 知识缺口闭环
+### 9.3 知识缺口闭环
 
 ```mermaid
 flowchart TB
-    Miss[not_found / low_confidence] --> Log[记录知识缺口]
+    Miss[未命中/低置信] --> Log[记录问题]
     Log --> Cluster[问题聚类]
-    Cluster --> Review[业务复核]
-    Review --> Add[补充或修订知识]
-    Add --> Eval[回归评测]
-    Eval --> Publish[重新入库发布]
+    Cluster --> Task[形成补知识任务]
+    Task --> Biz[业务人员补充知识]
+    Biz --> Review[审核发布]
+    Review --> Eval[回归评测]
+    Eval --> Online[重新入库]
 ```
 
-缺口聚类后，可以作为业务人员更新知识的任务来源。
+这个机制是后续知识平台的重要入口。它能告诉业务人员：用户经常问什么，但知识库还没覆盖好。
 
-## 12. 安全、审计与隐私
+## 10. 安全、审计和隐私
 
-### 12.1 数据安全边界
+### 10.1 敏感数据原则
 
 ```mermaid
 flowchart LR
-    Sensitive[敏感/实时数据] --> Block[不进入 RAG]
     Query[用户问题] --> Mask[脱敏记录]
-    User[用户ID/会话ID] --> Hash[Hash 存储]
-    Result[命中知识ID] --> Audit[审计日志]
+    User[用户 ID / 会话 ID] --> Hash[Hash 存储]
+    BizData[订单/余额/退款/设备实时状态] --> MCP[业务 MCP]
+    BizData -.不进入.-> RAG[RAG 知识库]
 ```
 
-### 12.2 审计记录
+原则：
 
-| 记录项 | 用途 |
+- RAG 不保存用户明文身份。
+- query 和 originalQuery 脱敏后记录。
+- 订单明细、余额、退款进度、设备实时状态不进入 RAG。
+- 命中的知识 ID、文档 ID、版本需要记录，方便审计。
+
+### 10.2 高风险内容控制
+
+| 风险场景 | 控制方式 |
 | --- | --- |
-| 请求 ID / Trace ID | 链路排查 |
-| 会话和用户 hash | 问题归因，不暴露明文身份 |
-| 脱敏后的 query | 分析召回和知识缺口 |
-| filters / intent | 分析 Agent 路由质量 |
-| 命中知识 ID | 知识追溯和效果评估 |
-| 状态和置信度 | 质量统计 |
-| 耗时和错误码 | 性能与稳定性排查 |
+| 卡券、活动、优惠 | 返回 forbiddenClaims，禁止承诺一定可用或补发 |
+| 退款、计费 | 禁止根据静态规则判断具体订单金额或进度 |
+| 投诉、赔偿 | 引导转人工，禁止 Agent 承诺赔偿 |
+| 法务和强监管内容 | 需要更高审核等级和更严格阈值 |
 
-### 12.3 高风险知识控制
+## 11. 技术选型说明
 
-| 机制 | 目的 |
-| --- | --- |
-| allowedClaims | 限定 Agent 可以表达什么 |
-| forbiddenClaims | 阻止 Agent 绝对化承诺或越权判断 |
-| 风险提示类知识 | 引导转人工或调用业务 MCP |
-| 置信度阈值 | 低置信时不让 Agent 直接当确定答案 |
-
-## 13. 当前风险与应对策略
-
-| 风险 | 表现 | 应对策略 |
+| 能力 | 第一版选型 | 设计原因 |
 | --- | --- | --- |
-| 知识质量不足 | 召回到了旧知识或缺少关键知识 | 模板校验、复核提醒、业务负责人、评测集回归 |
-| 检索效果波动 | 口语问题、跨域问题召回不稳 | Qwen query rewrite、rerank、badcase 调优、阈值分层 |
-| 云模型依赖 | 网络抖动、超时、供应商异常 | 超时控制、失败兜底、短重试、provider 抽象、后续模型网关 |
-| Agent 路由错误 | 实时业务问题误走 RAG | 明确业务真值边界，Agent 优先调用业务 MCP |
-| 知识维护成本 | Markdown 长期维护门槛高 | 中后期建设知识平台，表单化、审批、版本、复核 |
-| 数据隐私 | 日志中出现用户敏感信息 | hash、脱敏、敏感字段不入库、日志保留周期 |
-| 存储演进 | SQLite 不适合长期多人治理 | 第一版轻量使用，后续迁移知识平台数据库 |
+| API 服务 | FastAPI | 类型清晰、开发快，适合服务化接口 |
+| 向量库 | Qdrant | 支持向量检索、payload 过滤、alias 发布，本地 Docker 易部署 |
+| Embedding | DashScope Qwen embedding | 中文效果较好，第一版无需本地 GPU |
+| Rerank | DashScope Qwen rerank | 提升 FAQ、规则、故障排查类知识排序质量 |
+| Query Rewrite | DashScope Qwen 小模型 | 能结合 Agent 上下文生成更适合知识库的检索短句 |
+| 知识源 | Markdown + Git | 快速启动、可审计、可回滚，后续可作为平台发布快照 |
+| 元数据 | SQLite | 第一版轻量保存审计、缺口、入库记录，后续可迁移数据库 |
+| 部署 | Docker Compose | 方便本地和联调环境快速启动 |
 
-## 14. 阶段规划与里程碑
+后续所有模型调用都应该保持 provider 抽象，避免和单一供应商强绑定。
+
+## 12. 风险与应对策略
+
+| 风险 | 说明 | 应对策略 |
+| --- | --- | --- |
+| 知识质量风险 | 业务知识写得不准、过期或缺少边界 | 模板、字段校验、审核、复核提醒、评测回归 |
+| 检索效果风险 | 用户口语表达和知识标题不一致 | Qwen query rewrite、相似问法、rerank、badcase 闭环 |
+| 业务真值混淆 | Agent 把实时业务问题误交给 RAG | 明确路由边界，订单/退款/设备状态必须查 MCP |
+| 云模型依赖 | 模型接口超时或不可用 | 超时、短重试、失败兜底、provider 抽象、后续模型网关 |
+| Markdown 维护门槛 | 业务人员长期直接写 Markdown 不现实 | 中后期建设知识维护平台，表单化维护 |
+| 隐私风险 | 日志中可能出现用户敏感信息 | hash、脱敏、敏感业务数据不入库 |
+| 存储演进风险 | SQLite 不适合长期多人协作和平台化 | 第一版轻量使用，平台期迁移到业务数据库 |
+
+## 13. 阶段规划
 
 ```mermaid
 flowchart LR
-    V01[v0.1<br/>基础链路] --> V02[v0.2<br/>观测评测]
-    V02 --> V03[v0.3<br/>知识治理]
-    V03 --> V10[v1.0<br/>平台化生产]
-
-    V01 --> A[查询接口<br/>Markdown 入库<br/>Qdrant 召回<br/>Rerank]
-    V02 --> B[观测台<br/>评测集<br/>Badcase 闭环<br/>知识缺口聚类]
-    V03 --> C[独立知识仓库<br/>复核提醒<br/>发布报告<br/>版本保留]
-    V10 --> D[知识维护平台<br/>审批流<br/>权限<br/>监控告警<br/>灰度发布]
+    V01[v0.1<br/>独立 RAG 主链路] --> V02[v0.2<br/>观测评测闭环]
+    V02 --> V03[v0.3<br/>知识治理增强]
+    V03 --> V10[v1.0<br/>知识平台化]
 ```
 
-### 14.1 阶段目标表
-
-| 阶段 | 目标 | 重点产出 |
+| 阶段 | 目标 | 重点能力 |
 | --- | --- | --- |
-| v0.1 | 打通 RAG 独立服务主链路 | 查询接口、知识格式、入库、召回、重排、基础审计 |
-| v0.2 | 让效果可观测、可评测、可优化 | 观测台、评测集、badcase、知识缺口聚类 |
-| v0.3 | 让知识治理流程稳定 | 独立知识仓库、复核任务、发布报告、版本保留 |
-| v1.0 | 进入平台化和生产化 | 知识维护平台、审批流、权限、监控告警、灰度发布 |
+| v0.1 | 打通独立 RAG 服务 | Agent 接口、Markdown 入库、Qdrant 召回、rerank、审计 |
+| v0.2 | 让效果可看、可评、可优化 | 观测台、评测集、badcase、知识缺口聚类 |
+| v0.3 | 让知识治理更稳定 | 独立知识仓库、复核提醒、发布报告、版本保留 |
+| v1.0 | 让业务人员可自主维护 | 知识维护平台、表单编辑、审核流、版本管理、发布回滚 |
 
-## 15. 后续设计理念
-
-### 15.1 从“工具”变成“知识基础设施”
-
-```mermaid
-flowchart LR
-    Tool[单 Agent FAQ 工具] --> Service[独立 RAG 服务]
-    Service --> Infra[多 Agent 知识基础设施]
-    Infra --> Platform[业务知识治理平台]
-```
-
-RAG 不应只是一个检索接口，而应逐步承担知识资产治理能力：
-
-- 统一知识入口。
-- 统一发布流程。
-- 统一评测标准。
-- 统一审计追溯。
-- 支持多个 Agent 复用。
-
-### 15.2 业务人员是知识质量第一责任人
+## 14. 最终设计目标
 
 ```mermaid
 flowchart TB
-    Business[业务人员] --> Platform[知识平台]
-    Platform --> Validate[字段校验/风险校验]
-    Validate --> Review[审核]
-    Review --> Publish[发布]
-    Publish --> RAG[RAG 入库]
-    RAG --> Agent[Agent 使用]
-    Agent --> Gap[知识缺口反馈]
-    Gap --> Business
+    Goal[最终目标] --> Reliable[Agent 回答有依据]
+    Goal --> Governed[知识有治理]
+    Goal --> Maintainable[业务可维护]
+    Goal --> Observable[效果可观测]
+    Goal --> Evolvable[架构可演进]
 ```
 
-研发负责平台、工具、校验和发布链路；业务人员负责知识内容准确性和更新及时性。
+最终希望形成的是一套“业务知识治理 + RAG 检索服务 + Agent 使用规范”的闭环：
 
-### 15.3 可替换模型，不绑定供应商
-
-| 层 | 设计 |
-| --- | --- |
-| Query Rewrite | provider 抽象，当前 Qwen，后续可接内部模型 |
-| Embedding | provider 抽象，当前 DashScope，后续可本地化 |
-| Rerank | provider 抽象，当前 Qwen rerank，后续可按效果替换 |
-| 向量库 | 当前 Qdrant，保留迁移可能 |
-
-## 16. 汇报时可强调的结论
-
-```mermaid
-flowchart TB
-    C1[独立 RAG 不是为了替代 Agent]
-    C2[它是为了让 Agent 回答有依据]
-    C3[不是知识主库，而是知识检索服务]
-    C4[不是一次性项目，而是知识治理闭环]
-    C5[第一版快速落地，后续平台化演进]
-```
-
-建议对组长强调：
-
-| 结论 | 说明 |
-| --- | --- |
-| 边界清楚 | RAG 找知识，Agent 组织话术，业务 MCP 查实时数据 |
-| 架构可扩展 | 模型、向量库、知识源都有抽象和演进空间 |
-| 治理可持续 | 从 Markdown 到知识平台，逐步让业务人员维护 |
-| 效果可优化 | 观测台、评测集、缺口聚类形成持续改进闭环 |
-| 风险可控 | 高风险内容通过 forbiddenClaims、阈值、转人工策略控制 |
+- 业务人员维护知识。
+- 平台校验、审核、发布知识。
+- RAG 只读取已发布知识并提供可追溯召回。
+- Agent 基于召回结果组织回复。
+- 线上问题和未命中反向推动业务补知识。
