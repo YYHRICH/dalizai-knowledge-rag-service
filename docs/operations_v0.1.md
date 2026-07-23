@@ -163,6 +163,26 @@ rerank 文本包含 `title`、`summary`、`keywords`、`similarQuestions`、`con
 
 该策略主要用于处理类似“第一次用这个桩怎么开始？”这类业务已维护相似问法但 rerank 分数偏低的 case。
 
+## 开发调试台
+
+开发人员可以通过内置调试台模拟用户输入、选择 eval case、查看召回知识和预期对比。
+
+```text
+http://127.0.0.1:8100/debug
+```
+
+调试台页面本身不做登录态，调用调试 API 时需要在页面中填写 `RAG_ADMIN_API_KEY`。
+
+调试 API：
+
+```http
+GET /v1/admin/eval-cases?source=knowledge
+GET /v1/admin/eval-cases?source=agent&includeNotCalled=true
+POST /v1/admin/debug/query
+```
+
+该页面只面向开发联调，不建议暴露到公网。
+
 ## RAG 评测
 
 评测脚本用于检索回归，不生成最终对客回答。第一版参考 Ragas 思路，输出以下指标：

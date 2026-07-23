@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RAG Debug Console</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --line: #d8dde6;
+      --text: #18202b;
+      --muted: #5c6675;
+      --accent: #0f766e;
+      --bad: #b42318;
+      --warn: #b54708;
+      --ok: #067647;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Arial, "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }
+    header { padding: 16px 24px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; align-items: center; gap: 16px; }
+    h1 { font-size: 20px; margin: 0; }
+    main { display: grid; grid-template-columns: 360px minmax(0, 1fr); gap: 16px; padding: 16px; }
+    section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+    h2 { font-size: 15px; margin: 0 0 12px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+    input, textarea, select { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 8px; font: inherit; background: white; }
+    textarea { resize: vertical; min-height: 72px; }
+    button { border: 1px solid #0b5f58; background: var(--accent); color: white; border-radius: 6px; padding: 8px 10px; cursor: pointer; font-weight: 600; }
+    button.secondary { background: white; color: var(--accent); }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .row > * { flex: 1; }
+    .status { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 8px; font-size: 12px; border: 1px solid var(--line); }
+    .success, .passed { color: var(--ok); border-color: #abefc6; background: #ecfdf3; }
+    .low_confidence, .warn { color: var(--warn); border-color: #fedf89; background: #fffaeb; }
+    .not_found, .error, .failed { color: var(--bad); border-color: #fecdca; background: #fef3f2; }
+    .metrics { display: grid; grid-template-columns: repeat(5, minmax(110px, 1fr)); gap: 8px; margin-bottom: 12px; }
+    .metric { border: 1px solid var(--line); border-radius: 6px; padding: 8px; background: #fbfcfe; }
+    .metric b { display: block; font-size: 18px; margin-top: 4px; }
+    .items { display: grid; gap: 10px; }
+    .item { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: white; }
+    .item h3 { margin: 0 0 6px; font-size: 15px; }
+    .meta { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+    .claims { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    ul { margin: 6px 0 0 18px; padding: 0; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #101828; color: #f2f4f7; border-radius: 8px; padding: 10px; max-height: 320px; overflow: auto; }
+    .muted { color: var(--muted); }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    @media (max-width: 980px) { main { grid-template-columns: 1fr; } .metrics { grid-template-columns: 1fr 1fr; } .claims { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>RAG Debug Console</h1>
+    <span class="muted">开发调试用</span>
+  </header>
+  <main>
+    <section>
+      <h2>查询输入</h2>
+      <label>Admin API Key</label>
+      <input id="adminKey" type="password" placeholder="RAG_ADMIN_API_KEY" />
+      <div class="row">
+        <div>
+          <label>Eval 来源</label>
+          <select id="caseSource">
+            <option value="knowledge">knowledge</option>
+            <option value="agent">agent</option>
+          </select>
+        </div>
+        <div>
+          <label>Eval Case</label>
+          <select id="caseSelect"><option value="">手动输入</option></select>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button class="secondary" id="loadCasesBtn">加载用例</button>
+        <button class="secondary" id="clearBtn">清空</button>
+      </div>
+      <label>用户原话 originalQuery</label>
+      <textarea id="originalQuery" placeholder="例如：第一次用这个桩怎么开始？"></textarea>
+      <label>检索 query</label>
+      <textarea id="query" placeholder="可填 Agent 改写后的检索 query"></textarea>
+      <div class="row">
+        <div>
+          <label>businessDomains</label>
+          <input id="businessDomains" placeholder="charging,coupon" />
+        </div>
+        <div>
+          <label>knowledgeTypes</label>
+          <input id="knowledgeTypes" placeholder="faq,operation_guide" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>intent</label>
+          <input id="intent" placeholder="faq" />
+        </div>
+        <div>
+          <label>subIntent</label>
+          <input id="subIntent" placeholder="charge_scan_guide" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>topK</label>
+          <input id="topK" type="number" min="1" max="10" value="5" />
+        </div>
+        <div>
+          <label>expectedStatus</label>
+          <select id="expectedStatus">
+            <option value="">不对比</option>
+            <option value="success">success</option>
+            <option value="low_confidence">low_confidence</option>
+            <option value="not_found">not_found</option>
+          </select>
+        </div>
+      </div>
+      <label>expectedKnowledgeId</label>
+      <input id="expectedKnowledgeId" placeholder="faq_charge_scan_001" />
+      <label>expectedContextIds</label>
+      <input id="expectedContextIds" placeholder="faq_charge_scan_001#main,faq_xxx#main" />
+      <div class="toolbar">
+        <button id="queryBtn">运行查询</button>
+      </div>
+      <p id="message" class="muted"></p>
+    </section>
+
+    <section>
+      <h2>结果观察</h2>
+      <div id="summary" class="metrics"></div>
+      <div id="items" class="items"></div>
+      <h2 style="margin-top:16px">原始响应</h2>
+      <pre id="raw">尚未查询</pre>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let cases = [];
+
+    function splitList(value) {
+      return value.split(',').map((v) => v.trim()).filter(Boolean);
+    }
+
+    function authHeaders() {
+      const key = $('adminKey').value.trim();
+      localStorage.setItem('ragDebugAdminKey', key);
+      return { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' };
+    }
+
+    function setMessage(text, isError = false) {
+      $('message').textContent = text;
+      $('message').style.color = isError ? 'var(--bad)' : 'var(--muted)';
+    }
+
+    function fillFromCase(item) {
+      $('originalQuery').value = item.query;
+      $('query').value = item.query;
+      $('businessDomains').value = item.businessDomains.join(',');
+      $('knowledgeTypes').value = item.knowledgeTypes.join(',');
+      $('intent').value = item.intent || '';
+      $('subIntent').value = item.subIntent || '';
+      $('expectedStatus').value = item.expectedStatus || '';
+      $('expectedKnowledgeId').value = item.expectedKnowledgeId || '';
+      $('expectedContextIds').value = item.expectedContextIds.join(',');
+    }
+
+    async function loadCases() {
+      setMessage('加载用例中...');
+      const source = $('caseSource').value;
+      const res = await fetch(`/v1/admin/eval-cases?source=${source}`, { headers: authHeaders() });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      cases = data.cases;
+      $('caseSelect').innerHTML = '<option value="">手动输入</option>' + cases.map((c) => `<option value="${c.id}">${c.id}｜${c.query}</option>`).join('');
+      setMessage(`已加载 ${data.count} 条用例`);
+    }
+
+    function payload() {
+      const expectedStatus = $('expectedStatus').value;
+      return {
+        sessionId: 'debug_session',
+        channel: 'wechat_mini_program',
+        originalQuery: $('originalQuery').value.trim() || null,
+        query: $('query').value.trim(),
+        intent: $('intent').value.trim() || null,
+        subIntent: $('subIntent').value.trim() || null,
+        topK: Number($('topK').value || 5),
+        filters: {
+          businessDomains: splitList($('businessDomains').value),
+          knowledgeTypes: splitList($('knowledgeTypes').value),
+          effectiveOnly: true,
+          cityCode: null,
+          stationId: null,
+        },
+        expectedStatus: expectedStatus || null,
+        expectedKnowledgeId: $('expectedKnowledgeId').value.trim() || null,
+        expectedContextIds: splitList($('expectedContextIds').value),
+      };
+    }
+
+    function metric(label, value, cls = '') {
+      return `<div class="metric"><span class="muted">${label}</span><b class="${cls}">${value}</b></div>`;
+    }
+
+    function render(data) {
+      const r = data.response;
+      const e = data.evaluation;
+      $('summary').innerHTML = [
+        metric('status', r.status, r.status),
+        metric('confidence', Number(r.confidence).toFixed(4)),
+        metric('latencyMs', r.latencyMs ?? '-'),
+        metric('items', r.items.length),
+        metric('eval', e ? (e.passed ? 'passed' : 'failed') : '-', e ? (e.passed ? 'passed' : 'failed') : ''),
+      ].join('');
+      $('items').innerHTML = r.items.map((item, idx) => `
+        <div class="item">
+          <h3>${idx + 1}. ${item.title}</h3>
+          <div class="meta">
+            <span>${item.knowledgeId}</span><span>${item.chunkId}</span><span>score=${Number(item.score).toFixed(4)}</span><span>${item.businessDomain || ''}/${item.knowledgeType || ''}</span>
+          </div>
+          <p>${item.summary}</p>
+          <div class="claims">
+            <div><b>Allowed Claims</b><ul>${item.allowedClaims.map((c) => `<li>${c}</li>`).join('')}</ul></div>
+            <div><b>Forbidden Claims</b><ul>${item.forbiddenClaims.map((c) => `<li>${c}</li>`).join('')}</ul></div>
+          </div>
+        </div>`).join('') || '<p class="muted">没有召回知识</p>';
+      $('raw').textContent = JSON.stringify(data, null, 2);
+    }
+
+    async function runQuery() {
+      if (!$('query').value.trim()) { setMessage('请先输入 query', true); return; }
+      setMessage('查询中...');
+      const res = await fetch('/v1/admin/debug/query', { method: 'POST', headers: authHeaders(), body: JSON.stringify(payload()) });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      render(data);
+      setMessage('查询完成');
+    }
+
+    $('adminKey').value = localStorage.getItem('ragDebugAdminKey') || '';
+    $('loadCasesBtn').onclick = () => loadCases().catch((err) => setMessage(err.message, true));
+    $('queryBtn').onclick = () => runQuery().catch((err) => setMessage(err.message, true));
+    $('clearBtn').onclick = () => location.reload();
+    $('caseSelect').onchange = () => {
+      const item = cases.find((c) => c.id === $('caseSelect').value);
+      if (item) fillFromCase(item);
+    };
+  </script>
+</body>
+</html>

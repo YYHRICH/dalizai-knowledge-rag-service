@@ -62,6 +62,12 @@ docker compose up qdrant
 .\.venv\Scripts\python scripts\run_eval.py --knowledge-dir knowledge --fail-under 0.75
 ```
 
+RAG 调试台：
+
+```text
+http://127.0.0.1:8100/debug
+```
+
 ## 文档入口
 
 - [接口协议](docs/interface_v0.2.md)

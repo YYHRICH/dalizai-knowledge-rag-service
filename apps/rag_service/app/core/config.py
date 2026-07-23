@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     gap_cluster_batch_size: int = 100
 
     rag_metadata_db_url: str = "sqlite:///data/rag_service.db"
+    knowledge_base_dir: str = "knowledge"
 
 
 settings = Settings()

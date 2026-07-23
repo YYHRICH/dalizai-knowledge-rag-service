@@ -174,3 +174,106 @@ def test_ready_checks_ingest_and_qdrant(monkeypatch, tmp_path) -> None:
     assert body["status"] == "ready"
     assert body["qdrant"] == {"status": "ok", "pointCount": 24}
     assert body["latestIngest"]["ingest_id"] == "ingest_ready"
+
+
+
+def test_debug_page() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/debug")
+
+    assert response.status_code == 200
+    assert "RAG Debug Console" in response.text
+
+
+def test_list_eval_cases_endpoint(monkeypatch) -> None:
+    from apps.rag_service.app.api import routes
+
+    monkeypatch.setattr(routes.settings, "rag_admin_api_key", "admin_key")
+    client = TestClient(create_app())
+
+    response = client.get(
+        "/v1/admin/eval-cases?source=agent",
+        headers={"Authorization": "Bearer admin_key"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["source"] == "agent"
+    assert body["count"] == 9
+    assert all(item["shouldCallRag"] for item in body["cases"])
+
+
+def test_list_eval_cases_can_include_not_called(monkeypatch) -> None:
+    from apps.rag_service.app.api import routes
+
+    monkeypatch.setattr(routes.settings, "rag_admin_api_key", "admin_key")
+    client = TestClient(create_app())
+
+    response = client.get(
+        "/v1/admin/eval-cases?source=agent&includeNotCalled=true",
+        headers={"Authorization": "Bearer admin_key"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 12
+    assert any(item["expectedStatus"] == "not_called" for item in body["cases"])
+
+
+def test_debug_query_returns_response_and_evaluation(monkeypatch) -> None:
+    from apps.rag_service.app.api import routes
+    from apps.rag_service.app.schemas.rag import KnowledgeItemResponse, KnowledgeSource, RagQueryResponse
+
+    class FakeRagQueryService:
+        def __init__(self, settings):
+            self.settings = settings
+
+        def query(self, request):
+            assert request.query == "怎么扫码充电？"
+            return RagQueryResponse(
+                requestId=request.requestId,
+                traceId=request.traceId,
+                status="success",
+                answerable=True,
+                confidence=0.9,
+                items=[
+                    KnowledgeItemResponse(
+                        knowledgeId="faq_charge_scan_001",
+                        chunkId="faq_charge_scan_001#main",
+                        title="怎么扫码充电？",
+                        summary="用户连接充电枪后，可以通过小程序扫码启动充电。",
+                        content="余额不足或设备不可用时，系统会在启动前提示。",
+                        score=0.9,
+                        allowedClaims=["用户连接充电枪后，可以在小程序中扫码启动充电。"],
+                        forbiddenClaims=[],
+                        source=KnowledgeSource(docId="doc_charging_faq_v1"),
+                    )
+                ],
+                latencyMs=12,
+            )
+
+    monkeypatch.setattr(routes.settings, "rag_admin_api_key", "admin_key")
+    monkeypatch.setattr(routes, "RagQueryService", FakeRagQueryService)
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/v1/admin/debug/query",
+        headers={"Authorization": "Bearer admin_key"},
+        json={
+            "requestId": "debug_test_001",
+            "traceId": "trace_debug_test_001",
+            "query": "怎么扫码充电？",
+            "filters": {"businessDomains": ["charging"], "knowledgeTypes": ["faq"]},
+            "expectedStatus": "success",
+            "expectedKnowledgeId": "faq_charge_scan_001",
+            "expectedContextIds": ["faq_charge_scan_001#main"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["response"]["status"] == "success"
+    assert body["response"]["items"][0]["knowledgeId"] == "faq_charge_scan_001"
+    assert body["evaluation"]["passed"] is True
+    assert body["evaluation"]["retrievedContextIds"] == ["faq_charge_scan_001#main"]

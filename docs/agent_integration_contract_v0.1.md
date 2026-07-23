@@ -259,3 +259,14 @@ rag_result = response.json()
 - `requestId/traceId/sessionId/channel/filters` 能稳定透传。
 - RAG audit log 可以用 `traceId` 回查。
 - `eval/agent_cases.jsonl` 样例能作为联调基准。
+
+
+## 11. 调试台
+
+开发联调时可以打开：
+
+```text
+http://127.0.0.1:8100/debug
+```
+
+页面支持手动输入 query、选择 eval case、查看召回知识、allowedClaims、forbiddenClaims、status、confidence 和评测对比。
