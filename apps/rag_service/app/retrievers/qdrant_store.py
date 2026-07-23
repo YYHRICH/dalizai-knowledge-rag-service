@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from apps.rag_service.app.schemas.rag import RagFilters
+
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
@@ -27,6 +29,61 @@ class QdrantKnowledgeStore:
     ) -> None:
         self.settings = settings
         self.client = client or QdrantClient(url=settings.url, api_key=settings.api_key or None)
+
+
+    def search(
+        self,
+        collection_name: str,
+        query_vector: list[float],
+        filters: RagFilters,
+        limit: int,
+        channel: str | None = None,
+    ) -> list[Any]:
+        result = self.client.query_points(
+            collection_name=collection_name,
+            query=query_vector,
+            query_filter=self._build_filter(filters, channel),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return list(result.points)
+
+    def _build_filter(self, filters: RagFilters, channel: str | None = None) -> qmodels.Filter:
+        must: list[qmodels.Condition] = []
+        if filters.businessDomains:
+            must.append(
+                qmodels.FieldCondition(
+                    key="businessDomain",
+                    match=qmodels.MatchAny(any=filters.businessDomains),
+                )
+            )
+        if filters.knowledgeTypes:
+            must.append(
+                qmodels.FieldCondition(
+                    key="knowledgeType",
+                    match=qmodels.MatchAny(any=filters.knowledgeTypes),
+                )
+            )
+        if filters.effectiveOnly:
+            must.append(qmodels.FieldCondition(key="status", match=qmodels.MatchValue(value="active")))
+
+        # Scope filtering: global knowledge uses empty arrays. If request has a specific city/station,
+        # allow both global and matching scoped knowledge. If not, only global knowledge is allowed.
+        must.append(self._scope_condition("channels", channel))
+        must.append(self._scope_condition("cityCodes", filters.cityCode))
+        must.append(self._scope_condition("stationIds", filters.stationId))
+        return qmodels.Filter(must=must)
+
+    def _scope_condition(self, key: str, value: str | None) -> qmodels.Filter:
+        if value:
+            return qmodels.Filter(
+                should=[
+                    qmodels.IsEmptyCondition(is_empty=qmodels.PayloadField(key=key)),
+                    qmodels.FieldCondition(key=key, match=qmodels.MatchAny(any=[value])),
+                ]
+            )
+        return qmodels.Filter(must=[qmodels.IsEmptyCondition(is_empty=qmodels.PayloadField(key=key))])
 
     def recreate_collection(self, collection_name: str) -> None:
         self.client.recreate_collection(
