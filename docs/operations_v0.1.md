@@ -60,10 +60,13 @@ QDRANT_KEEP_COLLECTIONS=2
 
 ```http
 GET /v1/admin/knowledge/review-due
-GET /v1/admin/knowledge-gaps
+GET /v1/admin/knowledge-gaps?handledStatus=open&limit=100&offset=0
+PATCH /v1/admin/knowledge-gaps/{cluster_id}/status
 ```
 
-管理接口使用独立 `RAG_ADMIN_API_KEY`，第一版只做查询，不做知识编辑。
+`knowledge-gaps` 用于查看聚类后的待补知识问题，状态流转支持 `open`、`planned`、`resolved`、`ignored`。
+
+管理接口使用独立 `RAG_ADMIN_API_KEY`，第一版只做治理状态流转，不做知识编辑。
 
 ## 知识缺口聚类
 

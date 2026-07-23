@@ -353,7 +353,12 @@ class MetadataRepository:
             )
         return action_id
 
-    def list_gap_clusters(self, handled_status: str | None = None) -> list[dict[str, Any]]:
+    def list_gap_clusters(
+        self,
+        handled_status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             if handled_status:
                 rows = connection.execute(
@@ -361,17 +366,31 @@ class MetadataRepository:
                     SELECT * FROM knowledge_gap_clusters
                     WHERE handled_status = ?
                     ORDER BY last_seen_at DESC
+                    LIMIT ? OFFSET ?
                     """,
-                    (handled_status,),
+                    (handled_status, limit, offset),
                 ).fetchall()
             else:
                 rows = connection.execute(
                     """
                     SELECT * FROM knowledge_gap_clusters
                     ORDER BY last_seen_at DESC
-                    """
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
                 ).fetchall()
-            return [dict(row) for row in rows]
+            return [self._decode_gap_cluster_row(dict(row)) for row in rows]
+
+    def get_gap_cluster(self, cluster_id: str) -> dict[str, Any] | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM knowledge_gap_clusters
+                WHERE cluster_id = ?
+                """,
+                (cluster_id,),
+            ).fetchone()
+        return self._decode_gap_cluster_row(dict(row)) if row else None
 
 
     def _decode_gap_event_row(self, row: dict[str, Any]) -> dict[str, Any]:
