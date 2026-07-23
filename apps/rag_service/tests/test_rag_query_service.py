@@ -135,3 +135,41 @@ def test_query_not_found_when_no_points() -> None:
     assert gap_event.status == "not_found"
     assert gap_event.business_domain_guess == "charging"
     assert gap_event.knowledge_type_guess == "faq"
+
+
+def test_query_signal_score_boosts_similar_questions() -> None:
+    service = RagQueryService.__new__(RagQueryService)
+
+    score = service._query_signal_score(
+        "第一次用这个桩怎么开始？",
+        {
+            "title": "怎么扫码充电？",
+            "keywords": ["扫码", "二维码", "启动充电", "连接充电枪"],
+            "similarQuestions": [
+                "怎么扫码充电？",
+                "第一次用大力仔怎么开始充电？",
+                "扫哪里可以启动充电？",
+            ],
+        },
+    )
+
+    assert score >= 0.78
+
+
+def test_query_signal_score_does_not_boost_specific_order_amount_query() -> None:
+    service = RagQueryService.__new__(RagQueryService)
+
+    score = service._query_signal_score(
+        "我这笔订单为什么扣了20块？",
+        {
+            "title": "觉得订单扣费异常怎么办？",
+            "keywords": ["扣费异常", "费用明细", "订单金额", "多扣费"],
+            "similarQuestions": [
+                "为什么这单扣这么多？",
+                "我是不是被多扣了？",
+                "这笔订单费用不对怎么办？",
+            ],
+        },
+    )
+
+    assert score == 0.0

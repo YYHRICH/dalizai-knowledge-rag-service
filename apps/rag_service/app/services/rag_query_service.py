@@ -98,7 +98,9 @@ class RagQueryService:
         for result in rerank_results:
             point = point_by_chunk_id.get(result.id)
             if point:
-                ranked_points.append((point, result.score))
+                score = max(result.score, self._query_signal_score(query_rewrite, point.payload))
+                ranked_points.append((point, score))
+        ranked_points.sort(key=lambda item: item[1], reverse=True)
 
         if not ranked_points:
             return self._response(
@@ -248,10 +250,56 @@ class RagQueryService:
         parts = [
             f"标题：{payload.get('title') or ''}",
             f"摘要：{payload.get('summary') or ''}",
+            "关键词：" + "；".join(payload.get("keywords") or []),
+            "相似问法：" + "；".join(payload.get("similarQuestions") or []),
             f"正文：{payload.get('content') or ''}",
             "允许表达：" + "；".join(payload.get("allowedClaims") or []),
         ]
-        return "\n".join(parts)
+        return "\n".join(part for part in parts if part.strip("："))
+
+    def _query_signal_score(self, query: str, payload: dict[str, Any]) -> float:
+        candidates = [
+            str(payload.get("title") or ""),
+            *[str(value) for value in payload.get("keywords") or []],
+            *[str(value) for value in payload.get("similarQuestions") or []],
+        ]
+        normalized_query = self._normalize_signal_text(query)
+        if not normalized_query:
+            return 0.0
+        best_similarity = 0.0
+        for candidate in candidates:
+            normalized_candidate = self._normalize_signal_text(candidate)
+            if not normalized_candidate:
+                continue
+            if normalized_query == normalized_candidate:
+                return 0.92
+            if len(normalized_candidate) >= 4 and normalized_candidate in normalized_query:
+                return 0.88
+            if len(normalized_query) >= 4 and normalized_query in normalized_candidate:
+                return 0.88
+            best_similarity = max(
+                best_similarity,
+                self._char_bigram_similarity(normalized_query, normalized_candidate),
+            )
+        if best_similarity >= 0.55:
+            return 0.90
+        if best_similarity >= 0.30:
+            return 0.78
+        return 0.0
+
+    def _normalize_signal_text(self, value: str) -> str:
+        return "".join(ch.lower() for ch in value if ch.isalnum())
+
+    def _char_bigram_similarity(self, left: str, right: str) -> float:
+        if left == right:
+            return 1.0
+        if len(left) < 2 or len(right) < 2:
+            return 0.0
+        left_grams = {left[index : index + 2] for index in range(len(left) - 1)}
+        right_grams = {right[index : index + 2] for index in range(len(right) - 1)}
+        if not left_grams or not right_grams:
+            return 0.0
+        return len(left_grams & right_grams) / len(left_grams | right_grams)
 
     def _item_response(self, point: Any, score: float) -> KnowledgeItemResponse:
         payload = point.payload

@@ -96,6 +96,23 @@ PATCH /v1/admin/knowledge-gaps/{cluster_id}/status
 
 建议频率：前期每天 1 次；上线初期或高流量阶段可每小时 1 次。
 
+## 检索质量调优策略
+
+第一版查询链路使用两阶段排序：
+
+1. Qdrant embedding 召回。
+2. DashScope rerank 对候选知识重排。
+
+rerank 文本包含 `title`、`summary`、`keywords`、`similarQuestions`、`content`、`allowedClaims`。其中 `keywords` 和 `similarQuestions` 是业务人员显式维护的检索信号。
+
+为了降低口语化问法被 rerank 低估的风险，查询服务会对标题、关键词、相似问法做一个保守的本地信号补强：
+
+- 完全命中或包含关系时，提高置信度。
+- 字符 bigram 相似度达到阈值时，小幅提高置信度。
+- 不使用正文做本地补强，避免泛化过度。
+
+该策略主要用于处理类似“第一次用这个桩怎么开始？”这类业务已维护相似问法但 rerank 分数偏低的 case。
+
 ## RAG 评测
 
 评测脚本用于检索回归，不生成最终对客回答。第一版参考 Ragas 思路，输出以下指标：
