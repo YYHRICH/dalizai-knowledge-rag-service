@@ -1,3 +1,10 @@
+"""评测用例加载器。
+
+从两个来源加载评测用例：
+1. 知识库 Markdown 文件的内嵌 Eval Questions（``load_eval_cases_from_knowledge``）。
+2. 独立的 ``eval/agent_cases.jsonl`` 文件（``load_eval_cases_from_jsonl``）。
+"""
+
 from __future__ import annotations
 
 import json
@@ -8,6 +15,20 @@ from apps.rag_service.app.ingestion import KnowledgeMarkdownParser
 
 
 def load_eval_cases_from_knowledge(knowledge_dir: Path | str) -> list[RagEvalCase]:
+    """从知识库 Markdown 文件中加载评测用例。
+
+    解析所有 .md 文件，收集每个条目的 Eval Questions，
+    case_id 格式为 ``{knowledgeId}__eval_{NN}``。
+
+    Args:
+        knowledge_dir: 知识库根目录。
+
+    Returns:
+        评测用例列表。
+
+    Raises:
+        ValueError: 知识库有解析错误或 case_id 重复。
+    """
     documents, issues = KnowledgeMarkdownParser().parse_directory(knowledge_dir)
     errors = [issue for issue in issues if issue.level == "error"]
     if errors:
@@ -45,6 +66,21 @@ def load_eval_cases_from_knowledge(knowledge_dir: Path | str) -> list[RagEvalCas
 
 
 def load_eval_cases_from_jsonl(path: Path | str) -> list[RagEvalCase]:
+    """从 JSONL 文件加载评测用例。
+
+    每行一个 JSON 对象，支持 agent_cases.jsonl 格式。
+    自动补全 expectedContextIds（如果没有但 expectedKnowledgeId 存在，
+    则生成 ``{expectedKnowledgeId}#main``）。
+
+    Args:
+        path: JSONL 文件路径。
+
+    Returns:
+        评测用例列表。
+
+    Raises:
+        ValueError: case_id 重复。
+    """
     cases: list[RagEvalCase] = []
     seen_ids: set[str] = set()
     for line_no, line in enumerate(Path(path).read_text(encoding="utf-8-sig").splitlines(), start=1):

@@ -1,3 +1,8 @@
+"""评测报告生成工具。
+
+将评测结果序列化为 JSON 文件或终端可读的摘要文本。
+"""
+
 from __future__ import annotations
 
 import json
@@ -8,6 +13,7 @@ from apps.rag_service.app.evaluation.models import RagEvalReport
 
 
 def report_to_dict(report: RagEvalReport) -> dict:
+    """将评测报告转为可序列化的字典。"""
     return {
         "summary": asdict(report.summary),
         "results": [
@@ -36,6 +42,7 @@ def report_to_dict(report: RagEvalReport) -> dict:
 
 
 def write_json_report(report: RagEvalReport, path: Path | str) -> None:
+    """将评测报告写入 JSON 文件。自动创建父目录。"""
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -45,6 +52,7 @@ def write_json_report(report: RagEvalReport, path: Path | str) -> None:
 
 
 def format_summary(report: RagEvalReport) -> str:
+    """格式化为终端可读的评测摘要文本。"""
     summary = report.summary
     return "\n".join(
         [

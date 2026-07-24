@@ -1,3 +1,12 @@
+"""知识校验器。
+
+在校验 Markdown 解析结果的基础上，验证每份文档和每条知识条目的
+完整性、格式正确性和合规性。校验规则覆盖：
+
+- 文档级：必填元信息、业务域/知识类型白名单、日期格式、风险等级。
+- 条目级：knowledgeId 格式、摘要/正文长度、必填声明、风险评估。
+"""
+
 from __future__ import annotations
 
 import re
@@ -6,6 +15,8 @@ from datetime import datetime
 from typing import Any
 
 from .models import KnowledgeDocument, KnowledgeItem, ValidationIssue, ValidationReport
+
+# ── 白名单 ───────────────────────────────────────────────────
 
 BUSINESS_DOMAINS = {
     "charging",
@@ -20,6 +31,7 @@ BUSINESS_DOMAINS = {
     "customer_service",
     "general",
 }
+"""合法的业务域。不在白名单内的值会导致校验错误。"""
 
 KNOWLEDGE_TYPES = {
     "faq",
@@ -32,9 +44,14 @@ KNOWLEDGE_TYPES = {
     "service_rule",
     "risk_notice",
 }
+"""合法的知识类型。不在白名单内的值会导致校验错误。"""
 
 RISK_LEVELS = {"low", "medium", "high", "critical"}
+"""合法的风险等级。critical 级别在 v1 不允许 active。"""
+
 STATUSES = {"draft", "reviewing", "active", "disabled", "expired", "archived"}
+"""合法的知识状态。只有 active 且在有效期内的知识参与检索。"""
+
 REQUIRED_METADATA = {
     "docId",
     "docTitle",
@@ -46,16 +63,30 @@ REQUIRED_METADATA = {
     "updatedAt",
     "reviewDueAt",
 }
+"""文档 front matter 中必须填写的字段。"""
+
 KNOWLEDGE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*[0-9]{3}$")
+"""knowledgeId 格式：小写字母开头，字母/数字/下划线，三位数字结尾，如 ``faq_charge_scan_001``。"""
+
 HIGH_RISK_TYPES = {"billing_policy", "refund_policy", "coupon_policy", "risk_notice"}
+"""高风险的 knowledgeType 集合。这些类型默认 riskLevel=high，且必须有 forbiddenClaims。"""
 
 
 @dataclass(frozen=True)
 class ValidationOptions:
+    """校验选项。控制校验的严格程度。"""
+
     require_eval_questions: bool = False
+    """是否强制要求每个条目都有 Eval Questions。评测/Mock 数据集场景下开启。"""
 
 
 class KnowledgeValidator:
+    """知识校验器。
+
+    对解析出的文档和条目执行全面的格式和完整性校验。
+    校验结果分为 error（阻止入库）和 warning（不阻止但建议修复）。
+    """
+
     def validate(
         self,
         documents: list[KnowledgeDocument],

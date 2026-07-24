@@ -1,4 +1,17 @@
-"""Validate and ingest knowledge Markdown files into Qdrant."""
+"""知识入库脚本。
+
+完整流程：
+1. 解析 knowledge/ 目录下所有 Markdown 文件。
+2. 校验知识格式和完整性。
+3. 调用 DashScope Embedding API 将所有条目向量化（每批 20 条）。
+4. 在 Qdrant 中创建新的 build collection，批量写入向量和 payload。
+5. 原子切换 Qdrant alias 到新 collection（零停机更新）。
+6. 在元数据库中记录本次入库运行。
+
+用法：
+    python scripts/ingest_knowledge.py --validate-only              # 仅校验
+    python scripts/ingest_knowledge.py --require-eval-questions     # 入库且要求评测问题
+"""
 
 from __future__ import annotations
 
@@ -49,6 +62,8 @@ def batched(items: list, batch_size: int):
 
 
 def main() -> int:
+    """主入库流程入口。返回 0 成功，1 失败。"""
+    # 延迟导入，避免脚本启动时的额外开销
     from apps.rag_service.app.ingestion import (
         KnowledgeMarkdownParser,
         KnowledgeValidator,
@@ -64,6 +79,7 @@ def main() -> int:
     args = build_parser().parse_args()
     knowledge_dir = Path(args.knowledge_dir or os.getenv("KNOWLEDGE_BASE_DIR") or "knowledge")
 
+    # ── 阶段 1: 解析 + 校验 ─────────────────────────────
     started_at = utc_now_iso()
     version_suffix = utc_now_compact()
     knowledge_version = os.getenv("KNOWLEDGE_VERSION") or f"kb_{version_suffix}"
@@ -121,6 +137,7 @@ def main() -> int:
         print("status=validated")
         return 0
 
+    # ── 阶段 2: Embedding（每批 20 条） ──────────────────
     items = [item for document in report.documents for item in document.items]
     embedding_texts = [build_embedding_text(item) for item in items]
 
@@ -147,6 +164,7 @@ def main() -> int:
     finally:
         embedding_client.close()
 
+    # ── 阶段 3: 写入 Qdrant + 切换 alias ────────────────
     store = QdrantKnowledgeStore(
         QdrantStoreSettings(
             url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"),
@@ -156,8 +174,10 @@ def main() -> int:
             vector_size=settings.embedding_dimension,
         )
     )
+    # 创建全新的 build collection 并写入全部向量
     store.recreate_collection(build_collection)
     store.upsert_items(build_collection, items, vectors, knowledge_version)
+    # 校验写入数量
     point_count = store.count_points(build_collection)
     if point_count != len(items):
         repository.create_ingest_run(
@@ -180,6 +200,7 @@ def main() -> int:
         print(f"ERROR pointCountMismatch expected={len(items)} actual={point_count}")
         return 1
 
+    # 原子切换 alias：新 collection 上线，旧 collection 保留
     store.switch_alias(build_collection)
     status = "success_with_warnings" if report.warnings else "success"
     repository.create_ingest_run(

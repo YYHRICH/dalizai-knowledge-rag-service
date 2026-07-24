@@ -1,3 +1,22 @@
+"""API 路由定义。
+
+全部 HTTP 端点一览：
+
+============ ====== ====================== ==================
+端点          方法   鉴权                    用途
+============ ====== ====================== ==================
+/health       GET    无                     基本健康检查
+/v1/health    GET    无                     详细就绪检查
+/ready        GET    Admin API Key          完整健康 + 入库信息
+/v1/rag/query POST   Service API Key        RAG 检索（Agent 调用）
+/v1/admin/knowledge-gaps GET Admin API Key  查看缺口集群
+/v1/admin/knowledge-gaps/:id/status PATCH Admin API Key 更新缺口状态
+/v1/admin/eval-cases GET Admin API Key      查看评测用例
+/v1/admin/debug/query POST Admin API Key    调试查询（带自动评测）
+/debug        GET    无                     调试 HTML 页面
+============ ====== ====================== ==================
+"""
+
 from __future__ import annotations
 
 import uuid
@@ -66,6 +85,8 @@ def _eval_case_response(case: RagEvalCase) -> EvalCaseResponse:
 def _load_debug_eval_cases(source: EvalCaseSource, include_not_called: bool) -> list[RagEvalCase]:
     if source == "agent":
         cases = load_eval_cases_from_jsonl(Path("eval/agent_cases.jsonl"))
+    elif source == "jsonl":
+        cases = load_eval_cases_from_jsonl(Path("eval/cases.jsonl"))
     else:
         cases = load_eval_cases_from_knowledge(Path(settings.knowledge_base_dir))
     if include_not_called:
@@ -163,11 +184,13 @@ def _readiness_status(repository: MetadataRepository) -> dict[str, object]:
 
 @router.get("/health")
 def health() -> dict[str, str]:
+    """基本健康检查。无鉴权，返回固定 JSON。"""
     return {"status": "ok"}
 
 
 @router.get("/v1/health")
 def v1_health(repository: MetadataRepository = Depends(get_metadata_repository)) -> dict[str, object]:
+    """详细就绪检查。返回服务状态、Qdrant 连接和最新入库信息。"""
     return _readiness_status(repository)
 
 
@@ -176,6 +199,7 @@ def ready(
     _: None = Depends(require_admin_api_key),
     repository: MetadataRepository = Depends(get_metadata_repository),
 ) -> dict[str, object]:
+    """管理员就绪检查（需 Admin API Key）。返回与 /v1/health 相同的信息。"""
     return _readiness_status(repository)
 
 
@@ -184,6 +208,7 @@ def query_rag(
     request: RagQueryRequest,
     _: None = Depends(require_service_api_key),
 ) -> RagQueryResponse:
+    """RAG 检索（Agent 调用入口）。需 Service API Key Bearer Token 鉴权。"""
     service = RagQueryService(settings)
     return service.query(request)
 
@@ -196,6 +221,7 @@ def list_knowledge_gaps(
     _: None = Depends(require_admin_api_key),
     repository: MetadataRepository = Depends(get_metadata_repository),
 ) -> KnowledgeGapListResponse:
+    """分页查询知识缺口集群。默认只返回 open 状态的集群。需 Admin API Key。"""
     clusters = repository.list_gap_clusters(handledStatus, limit=limit, offset=offset)
     responses = [_cluster_response(cluster) for cluster in clusters]
     return KnowledgeGapListResponse(clusters=responses, count=len(responses))
@@ -211,6 +237,7 @@ def update_knowledge_gap_status(
     _: None = Depends(require_admin_api_key),
     repository: MetadataRepository = Depends(get_metadata_repository),
 ) -> UpdateKnowledgeGapStatusResponse:
+    """更新缺口集群的处理状态。同时写入操作审计记录。需 Admin API Key。"""
     if repository.get_gap_cluster(cluster_id) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -231,6 +258,7 @@ def update_knowledge_gap_status(
 
 @router.get("/debug", include_in_schema=False)
 def debug_page() -> FileResponse:
+    """返回 RAG 调试控制台 HTML 页面。无需鉴权。"""
     return FileResponse(Path(__file__).resolve().parents[1] / "static" / "debug.html")
 
 
@@ -240,6 +268,7 @@ def list_eval_cases(
     includeNotCalled: bool = Query(default=False),
     _: None = Depends(require_admin_api_key),
 ) -> EvalCaseListResponse:
+    """列出评测用例。支持 knowledge（内嵌）和 agent（JSONL）两个来源。需 Admin API Key。"""
     cases = _load_debug_eval_cases(source, includeNotCalled)
     responses = [_eval_case_response(case) for case in cases]
     return EvalCaseListResponse(source=source, cases=responses, count=len(responses))
@@ -250,6 +279,11 @@ def debug_query(
     request: DebugQueryRequest,
     _: None = Depends(require_admin_api_key),
 ) -> DebugQueryResponse:
+    """执行调试查询并返回 RAG 结果 + 自动评测。需 Admin API Key。
+
+    如果请求中包含期望值字段（expectedStatus、expectedContextIds 等），
+    会同时运行评测并返回 DebugQueryEvaluation。
+    """
     request_id = request.requestId or f"debug_{uuid.uuid4().hex}"
     trace_id = request.traceId or f"trace_{request_id}"
     rag_request = RagQueryRequest(

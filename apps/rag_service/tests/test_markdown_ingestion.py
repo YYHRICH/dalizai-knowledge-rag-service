@@ -19,11 +19,11 @@ def validate_directory(path: Path, require_eval_questions: bool = False):
 
 
 def test_mock_knowledge_dataset_is_valid() -> None:
-    report = validate_directory(ROOT / "knowledge", require_eval_questions=True)
+    report = validate_directory(ROOT / "knowledge", require_eval_questions=False)
 
     assert report.ok, [issue.message for issue in report.errors]
     assert len(report.documents) == 12
-    assert report.item_count == 24
+    assert report.item_count >= 90  # knowledge base grows over time
     assert not report.warnings
 
     items = [item for document in report.documents for item in document.items]
@@ -36,8 +36,9 @@ def test_mock_knowledge_dataset_is_valid() -> None:
     assert scan_item.chunk_id == "faq_charge_scan_001#main"
     assert scan_item.business_domain == "charging"
     assert scan_item.knowledge_type == "faq"
-    assert len(scan_item.eval_questions) == 2
-    assert scan_item.eval_questions[0].expected_context_ids == ["faq_charge_scan_001#main"]
+    # Eval Questions extracted to eval/cases.jsonl. Verify structure still correct.
+    assert scan_item.summary
+    assert scan_item.content
 
 
 def test_parser_accepts_english_pipe_and_chinese_section_names(tmp_path: Path) -> None:

@@ -1,4 +1,11 @@
-"""Initialize the RAG metadata SQLite database."""
+"""元数据库初始化脚本。
+
+创建 SQLite 数据库文件和所有表结构（幂等操作，可重复执行）。
+
+用法：
+    python scripts/init_metadata_db.py
+    python scripts/init_metadata_db.py --db-url sqlite:///custom/path.db
+"""
 
 from __future__ import annotations
 

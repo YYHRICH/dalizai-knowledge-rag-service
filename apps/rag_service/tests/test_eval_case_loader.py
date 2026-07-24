@@ -30,7 +30,8 @@ def test_load_eval_cases_from_jsonl(tmp_path) -> None:
 
 
 def test_load_eval_cases_from_knowledge() -> None:
-    cases = load_eval_cases_from_knowledge("knowledge")
+    # Eval Questions moved from Markdown to eval/cases.jsonl
+    cases = load_eval_cases_from_jsonl("eval/cases.jsonl")
 
     assert cases
     assert any(case.id == "faq_charge_scan_001__eval_01" for case in cases)

@@ -1,0 +1,1 @@
+{"id": "eval_001", "query": "怎么扫码充电？", "businessDomains": ["charging"], "knowledgeTypes": ["faq"], "expectedKnowledgeId": "faq_charge_scan_001", "expectedStatus": "success", "shouldCallRag": true}

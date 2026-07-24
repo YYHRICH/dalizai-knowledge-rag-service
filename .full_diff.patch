@@ -1,0 +1,4738 @@
+diff --git a/apps/rag_service/Dockerfile b/apps/rag_service/Dockerfile
+index 7f5a36b..dde156c 100644
+--- a/apps/rag_service/Dockerfile
++++ b/apps/rag_service/Dockerfile
+@@ -1,4 +1,5 @@
+-FROM python:3.11-slim
++# ── 生产阶段 ────────────────────────────────────────────────
++FROM python:3.11-slim AS production
+ 
+ ENV PYTHONDONTWRITEBYTECODE=1 \
+     PYTHONUNBUFFERED=1 \
+@@ -6,6 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
+ 
+ WORKDIR /app
+ 
++# 使用阿里云 PyPI 镜像，避免公司网络 SSL 证书问题
++RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
++    && pip config set global.trusted-host mirrors.aliyun.com
++
+ RUN python -m pip install --upgrade pip
+ 
+ COPY pyproject.toml README.md ./
+@@ -20,3 +25,12 @@ RUN python -m pip install .
+ EXPOSE 8100
+ 
+ CMD ["uvicorn", "apps.rag_service.app.main:app", "--host", "0.0.0.0", "--port", "8100"]
++
++# ── 测试阶段 ────────────────────────────────────────────────
++FROM production AS test
++
++# 安装开发依赖（pytest / ruff 等）
++RUN python -m pip install -e ".[dev]"
++
++# 默认跑全量测试。运行时可通过 volume 挂载 .env 获取 DASHSCOPE_API_KEY 等
++CMD ["python", "-m", "pytest", "apps/rag_service/tests/", "-v"]
+diff --git a/apps/rag_service/app/api/routes.py b/apps/rag_service/app/api/routes.py
+index 9c12775..7d523a5 100644
+--- a/apps/rag_service/app/api/routes.py
++++ b/apps/rag_service/app/api/routes.py
+@@ -1,3 +1,22 @@
++"""API 路由定义。
++
++全部 HTTP 端点一览：
++
++============ ====== ====================== ==================
++端点          方法   鉴权                    用途
++============ ====== ====================== ==================
++/health       GET    无                     基本健康检查
++/v1/health    GET    无                     详细就绪检查
++/ready        GET    Admin API Key          完整健康 + 入库信息
++/v1/rag/query POST   Service API Key        RAG 检索（Agent 调用）
++/v1/admin/knowledge-gaps GET Admin API Key  查看缺口集群
++/v1/admin/knowledge-gaps/:id/status PATCH Admin API Key 更新缺口状态
++/v1/admin/eval-cases GET Admin API Key      查看评测用例
++/v1/admin/debug/query POST Admin API Key    调试查询（带自动评测）
++/debug        GET    无                     调试 HTML 页面
++============ ====== ====================== ==================
++"""
++
+ from __future__ import annotations
+ 
+ import uuid
+@@ -163,11 +182,13 @@ def _readiness_status(repository: MetadataRepository) -> dict[str, object]:
+ 
+ @router.get("/health")
+ def health() -> dict[str, str]:
++    """基本健康检查。无鉴权，返回固定 JSON。"""
+     return {"status": "ok"}
+ 
+ 
+ @router.get("/v1/health")
+ def v1_health(repository: MetadataRepository = Depends(get_metadata_repository)) -> dict[str, object]:
++    """详细就绪检查。返回服务状态、Qdrant 连接和最新入库信息。"""
+     return _readiness_status(repository)
+ 
+ 
+@@ -176,6 +197,7 @@ def ready(
+     _: None = Depends(require_admin_api_key),
+     repository: MetadataRepository = Depends(get_metadata_repository),
+ ) -> dict[str, object]:
++    """管理员就绪检查（需 Admin API Key）。返回与 /v1/health 相同的信息。"""
+     return _readiness_status(repository)
+ 
+ 
+@@ -184,6 +206,7 @@ def query_rag(
+     request: RagQueryRequest,
+     _: None = Depends(require_service_api_key),
+ ) -> RagQueryResponse:
++    """RAG 检索（Agent 调用入口）。需 Service API Key Bearer Token 鉴权。"""
+     service = RagQueryService(settings)
+     return service.query(request)
+ 
+@@ -196,6 +219,7 @@ def list_knowledge_gaps(
+     _: None = Depends(require_admin_api_key),
+     repository: MetadataRepository = Depends(get_metadata_repository),
+ ) -> KnowledgeGapListResponse:
++    """分页查询知识缺口集群。默认只返回 open 状态的集群。需 Admin API Key。"""
+     clusters = repository.list_gap_clusters(handledStatus, limit=limit, offset=offset)
+     responses = [_cluster_response(cluster) for cluster in clusters]
+     return KnowledgeGapListResponse(clusters=responses, count=len(responses))
+@@ -211,6 +235,7 @@ def update_knowledge_gap_status(
+     _: None = Depends(require_admin_api_key),
+     repository: MetadataRepository = Depends(get_metadata_repository),
+ ) -> UpdateKnowledgeGapStatusResponse:
++    """更新缺口集群的处理状态。同时写入操作审计记录。需 Admin API Key。"""
+     if repository.get_gap_cluster(cluster_id) is None:
+         raise HTTPException(
+             status_code=status.HTTP_404_NOT_FOUND,
+@@ -231,6 +256,7 @@ def update_knowledge_gap_status(
+ 
+ @router.get("/debug", include_in_schema=False)
+ def debug_page() -> FileResponse:
++    """返回 RAG 调试控制台 HTML 页面。无需鉴权。"""
+     return FileResponse(Path(__file__).resolve().parents[1] / "static" / "debug.html")
+ 
+ 
+@@ -240,6 +266,7 @@ def list_eval_cases(
+     includeNotCalled: bool = Query(default=False),
+     _: None = Depends(require_admin_api_key),
+ ) -> EvalCaseListResponse:
++    """列出评测用例。支持 knowledge（内嵌）和 agent（JSONL）两个来源。需 Admin API Key。"""
+     cases = _load_debug_eval_cases(source, includeNotCalled)
+     responses = [_eval_case_response(case) for case in cases]
+     return EvalCaseListResponse(source=source, cases=responses, count=len(responses))
+@@ -250,6 +277,11 @@ def debug_query(
+     request: DebugQueryRequest,
+     _: None = Depends(require_admin_api_key),
+ ) -> DebugQueryResponse:
++    """执行调试查询并返回 RAG 结果 + 自动评测。需 Admin API Key。
++
++    如果请求中包含期望值字段（expectedStatus、expectedContextIds 等），
++    会同时运行评测并返回 DebugQueryEvaluation。
++    """
+     request_id = request.requestId or f"debug_{uuid.uuid4().hex}"
+     trace_id = request.traceId or f"trace_{request_id}"
+     rag_request = RagQueryRequest(
+diff --git a/apps/rag_service/app/core/config.py b/apps/rag_service/app/core/config.py
+index 48cd311..5dd0379 100644
+--- a/apps/rag_service/app/core/config.py
++++ b/apps/rag_service/app/core/config.py
+@@ -1,38 +1,108 @@
++"""全局配置模块。
++
++通过 pydantic-settings 从项目根目录的 ``.env`` 文件加载所有配置项。
++所有字段都有默认值，敏感信息（API Key）需要在部署时通过环境变量覆盖。
++
++使用方式：直接导入 ``settings`` 单例即可。
++"""
++
+ from __future__ import annotations
+ 
+ from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
+ 
+ class Settings(BaseSettings):
++    """大力仔知识 RAG 服务的全局配置。
++
++    配置优先级：环境变量 > .env 文件 > 代码默认值。
++    所有配置项的命名遵循小写下划线风格，pydantic-settings 会自动
++    与大写下划线风格的环境变量做映射（如 ``RAG_SERVICE_API_KEY``）。
++    """
++
+     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+ 
++    # ── RAG API 鉴权 ──────────────────────────────────────────
++
+     rag_service_api_key: str = "CHANGE_ME_RAG_SERVICE_API_KEY"
++    """Agent 调用 /v1/rag/query 时使用的 Bearer Token。部署时必须修改。"""
++
+     rag_admin_api_key: str = "CHANGE_ME_RAG_ADMIN_API_KEY"
++    """管理员调用 /v1/admin/* 和 /ready 端点时使用的 Bearer Token。部署时必须修改。"""
++
++    # ── RAG 检索参数 ──────────────────────────────────────────
++
+     rag_default_top_k: int = 5
++    """默认返回的知识条目数，当请求未指定 topK 时使用。"""
++
+     rag_max_top_k: int = 10
++    """允许的最大 topK，防止单次查询返回过多结果。"""
++
+     success_confidence_threshold: float = 0.75
++    """成功阈值：confidence >= 此值时 status=success，Agent 可放心使用 allowedClaims 回复。"""
++
+     low_confidence_threshold: float = 0.50
++    """低置信度下限：confidence 在此值与 success_threshold 之间时 status=low_confidence。"""
++
++    # ── Qdrant 向量库 ─────────────────────────────────────────
+ 
+     qdrant_url: str = "http://127.0.0.1:6333"
++    """Qdrant 服务地址，本地开发默认 127.0.0.1:6333，Docker 部署时通过环境变量覆盖。"""
++
+     qdrant_api_key: str | None = None
++    """Qdrant API Key，如果 Qdrant 开启了鉴权则填写。"""
++
+     qdrant_collection_alias: str = "dalizai_knowledge_v1"
++    """Qdrant collection 的别名，RAG 检索始终通过别名访问，不直连实际 collection。"""
++
+     qdrant_collection_prefix: str = "dalizai_knowledge"
++    """实际 collection 名称前缀，每次 ingest 会创建 {prefix}_{timestamp} 的新 collection。"""
++
++    # ── DashScope 模型服务 ────────────────────────────────────
+ 
+     dashscope_api_key: str = "CHANGE_ME_DASHSCOPE_API_KEY"
++    """阿里云 DashScope API Key，用于 embedding / rerank / chat 三个服务。"""
++
+     dashscope_embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
++    """DashScope Embedding 兼容模式 API 地址。"""
++
+     dashscope_rerank_base_url: str = "https://dashscope.aliyuncs.com/compatible-api/v1"
++    """DashScope Rerank 兼容 API 地址。"""
++
+     dashscope_chat_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
++    """DashScope Chat Completion 兼容模式 API 地址，用于 query rewrite 和 gap 摘要生成。"""
++
+     embedding_model: str = "qwen3.7-text-embedding"
++    """Embedding 模型名称，通过 DashScope 兼容模式 API 调用。"""
++
+     embedding_dimension: int = 1024
++    """Embedding 向量维度，必须与所选模型的实际输出一致。"""
++
+     rerank_model: str = "qwen3-rerank"
++    """Rerank 模型名称，通过 DashScope 兼容 API 调用。"""
++
+     rerank_top_n: int = 10
++    """Rerank 的召回上限，检索时 recall_limit = max(topK, rerank_top_n)。"""
++
+     query_rewrite_chat_model: str = "qwen-turbo"
++    """Query rewrite 使用的 Chat 模型，轻量级即可。"""
++
+     gap_cluster_chat_model: str = "qwen-turbo"
++    """知识缺口聚类摘要生成的 Chat 模型，轻量级即可。"""
++
+     gap_cluster_similarity_threshold: float = 0.82
++    """缺口聚类时两段文本视为"同类"的余弦相似度最低值。"""
++
+     gap_cluster_batch_size: int = 100
++    """每次聚类任务最多处理多少个未分配缺口事件。"""
++
++    # ── 元数据存储 ────────────────────────────────────────────
+ 
+     rag_metadata_db_url: str = "sqlite:///data/rag_service.db"
++    """SQLite 元数据库地址，存储审计日志、入库记录、知识缺口等。仅支持 sqlite:/// 前缀。"""
++
+     knowledge_base_dir: str = "knowledge"
++    """Markdown 知识库根目录，相对于项目根目录的路径。"""
+ 
+ 
++# 全局配置单例，服务启动时自动加载 .env 文件
+ settings = Settings()
+diff --git a/apps/rag_service/app/core/security.py b/apps/rag_service/app/core/security.py
+index d0dd2d0..6aed260 100644
+--- a/apps/rag_service/app/core/security.py
++++ b/apps/rag_service/app/core/security.py
+@@ -1,3 +1,10 @@
++"""API 鉴权模块。
++
++提供两个 FastAPI 依赖函数，通过 HTTP Bearer Token 控制访问权限。
++- 服务密钥：供 Agent/MCP 调用 RAG 查询接口
++- 管理员密钥：供运维人员访问管理端点和就绪检查
++"""
++
+ from __future__ import annotations
+ 
+ from fastapi import Header, HTTPException, status
+@@ -6,12 +13,36 @@ from .config import settings
+ 
+ 
+ def require_service_api_key(authorization: str | None = Header(default=None)) -> None:
++    """验证 Agent 服务调用密钥。
++
++    用于保护 POST /v1/rag/query 端点。
++    从 HTTP ``Authorization: Bearer <token>`` 头部提取 token，
++    与配置中的 ``RAG_SERVICE_API_KEY`` 比对。
++
++    Args:
++        authorization: HTTP Authorization 头部的值（FastAPI Header 自动注入）。
++
++    Raises:
++        HTTPException: 401，token 缺失或不匹配。
++    """
+     expected = f"Bearer {settings.rag_service_api_key}"
+     if not authorization or authorization != expected:
+         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+ 
+ 
+ def require_admin_api_key(authorization: str | None = Header(default=None)) -> None:
++    """验证管理员密钥。
++
++    用于保护 /ready、GET /v1/admin/*、POST /v1/admin/debug/query 等端点。
++    从 HTTP ``Authorization: Bearer <token>`` 头部提取 token，
++    与配置中的 ``RAG_ADMIN_API_KEY`` 比对。
++
++    Args:
++        authorization: HTTP Authorization 头部的值（FastAPI Header 自动注入）。
++
++    Raises:
++        HTTPException: 401，token 缺失或不匹配。
++    """
+     expected = f"Bearer {settings.rag_admin_api_key}"
+     if not authorization or authorization != expected:
+         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+diff --git a/apps/rag_service/app/evaluation/case_loader.py b/apps/rag_service/app/evaluation/case_loader.py
+index ac758d7..cfaf7e1 100644
+--- a/apps/rag_service/app/evaluation/case_loader.py
++++ b/apps/rag_service/app/evaluation/case_loader.py
+@@ -1,3 +1,10 @@
++"""评测用例加载器。
++
++从两个来源加载评测用例：
++1. 知识库 Markdown 文件的内嵌 Eval Questions（``load_eval_cases_from_knowledge``）。
++2. 独立的 ``eval/agent_cases.jsonl`` 文件（``load_eval_cases_from_jsonl``）。
++"""
++
+ from __future__ import annotations
+ 
+ import json
+@@ -8,6 +15,20 @@ from apps.rag_service.app.ingestion import KnowledgeMarkdownParser
+ 
+ 
+ def load_eval_cases_from_knowledge(knowledge_dir: Path | str) -> list[RagEvalCase]:
++    """从知识库 Markdown 文件中加载评测用例。
++
++    解析所有 .md 文件，收集每个条目的 Eval Questions，
++    case_id 格式为 ``{knowledgeId}__eval_{NN}``。
++
++    Args:
++        knowledge_dir: 知识库根目录。
++
++    Returns:
++        评测用例列表。
++
++    Raises:
++        ValueError: 知识库有解析错误或 case_id 重复。
++    """
+     documents, issues = KnowledgeMarkdownParser().parse_directory(knowledge_dir)
+     errors = [issue for issue in issues if issue.level == "error"]
+     if errors:
+@@ -45,6 +66,21 @@ def load_eval_cases_from_knowledge(knowledge_dir: Path | str) -> list[RagEvalCas
+ 
+ 
+ def load_eval_cases_from_jsonl(path: Path | str) -> list[RagEvalCase]:
++    """从 JSONL 文件加载评测用例。
++
++    每行一个 JSON 对象，支持 agent_cases.jsonl 格式。
++    自动补全 expectedContextIds（如果没有但 expectedKnowledgeId 存在，
++    则生成 ``{expectedKnowledgeId}#main``）。
++
++    Args:
++        path: JSONL 文件路径。
++
++    Returns:
++        评测用例列表。
++
++    Raises:
++        ValueError: case_id 重复。
++    """
+     cases: list[RagEvalCase] = []
+     seen_ids: set[str] = set()
+     for line_no, line in enumerate(Path(path).read_text(encoding="utf-8-sig").splitlines(), start=1):
+diff --git a/apps/rag_service/app/evaluation/evaluator.py b/apps/rag_service/app/evaluation/evaluator.py
+index d9bc3d0..0d871d7 100644
+--- a/apps/rag_service/app/evaluation/evaluator.py
++++ b/apps/rag_service/app/evaluation/evaluator.py
+@@ -1,3 +1,9 @@
++"""RAG 评测器。
++
++对一组评测用例批量执行 RAG 查询并对结果打分。
++评测指标包括：状态匹配、上下文精确率/召回率、忠实度代理、相关性代理。
++"""
++
+ from __future__ import annotations
+ 
+ from statistics import mean
+@@ -12,14 +18,23 @@ from apps.rag_service.app.schemas.rag import RagFilters, RagQueryRequest, RagQue
+ 
+ 
+ class RagEvaluator:
++    """RAG 评测器。将评测用例转为 RAG 请求，收集结果并汇总。"""
++
+     def __init__(self, query_service) -> None:
++        """初始化评测器。
++
++        Args:
++            query_service: RagQueryService 实例，用于执行实际的 RAG 查询。
++        """
+         self.query_service = query_service
+ 
+     def evaluate(self, cases: list[RagEvalCase]) -> RagEvalReport:
++        """批量评测一组用例。"""
+         results = [self.evaluate_case(case) for case in cases]
+         return RagEvalReport(summary=self._summary(results), results=results)
+ 
+     def evaluate_case(self, case: RagEvalCase) -> RagEvalCaseResult:
++        """评测单个用例：用 case 中的参数构造 RAG 请求，执行查询并打分。"""
+         response = self.query_service.query(
+             RagQueryRequest(
+                 requestId=f"eval_{case.id}",
+@@ -38,6 +53,7 @@ class RagEvaluator:
+         return score_case(case, response)
+ 
+     def _summary(self, results: list[RagEvalCaseResult]) -> RagEvalSummary:
++        """计算全部用例的汇总统计。所有指标取均值。"""
+         if not results:
+             return RagEvalSummary(0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+         return RagEvalSummary(
+@@ -55,6 +71,15 @@ class RagEvaluator:
+ 
+ 
+ def score_case(case: RagEvalCase, response: RagQueryResponse) -> RagEvalCaseResult:
++    """对单个评测用例打分。
++
++    加权公式：
++    score = 0.20 * status_match + 0.25 * context_precision
++          + 0.25 * context_recall + 0.15 * faithfulness_proxy
++          + 0.15 * response_relevancy_proxy
++
++    状态匹配权重最低（粗粒度），上下文精确率和召回率是核心指标。
++    """
+     retrieved_context_ids = [item.chunkId for item in response.items]
+     retrieved_knowledge_ids = [item.knowledgeId for item in response.items]
+     expected_context_ids = case.expected_context_ids
+diff --git a/apps/rag_service/app/evaluation/models.py b/apps/rag_service/app/evaluation/models.py
+index 38b4682..4655408 100644
+--- a/apps/rag_service/app/evaluation/models.py
++++ b/apps/rag_service/app/evaluation/models.py
+@@ -1,3 +1,8 @@
++"""RAG 评测的数据模型。
++
++定义了评测用例、评测结果、评测摘要和评测报告的数据结构。
++"""
++
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+@@ -7,57 +12,153 @@ from apps.rag_service.app.schemas.rag import RagQueryResponse
+ 
+ @dataclass(frozen=True)
+ class RagEvalCase:
++    """一条 RAG 评测用例。
++
++    定义了输入（查询、过滤条件）和期望输出（状态、命中的 chunk、关键声明）。
++    """
++
+     id: str
++    """用例唯一 ID。知识内置评测为 ``{knowledgeId}__eval_{NN}``，agent 评测来自 JSONL。"""
++
+     query: str
++    """测试查询文本。"""
++
+     expected_status: str
++    """期望的 RAG 检索状态，如 ``success``、``not_found``。"""
++
+     should_call_rag: bool = True
++    """该场景下 Agent 是否应该调用 RAG。False 表示这类问题不应走 RAG。"""
++
+     business_domains: list[str] = field(default_factory=list)
++    """查询时应用的业务域过滤。"""
++
+     knowledge_types: list[str] = field(default_factory=list)
++    """查询时应用的知识类型过滤。"""
++
+     expected_context_ids: list[str] = field(default_factory=list)
++    """期望命中的 chunk ID 列表。"""
++
+     expected_knowledge_id: str | None = None
++    """期望命中的知识 ID（宽松匹配）。"""
++
+     reference_answer: str | None = None
++    """参考答案，用于评测响应相关性。"""
++
+     expected_claims: list[str] = field(default_factory=list)
++    """期望检索结果中包含的关键声明。"""
++
+     negative_context_ids: list[str] = field(default_factory=list)
++    """不应出现在检索结果中的 chunk ID。"""
++
+     channel: str = "wechat_mini_program"
++    """模拟渠道。"""
++
+     intent: str | None = None
++    """模拟意图。"""
++
+     sub_intent: str | None = None
++    """模拟子意图。"""
++
+     notes: str | None = None
++    """用例备注。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class RagEvalCaseResult:
++    """单条用例的评测结果。
++
++    包含原始用例、RAG 响应和所有评测指标。
++    """
++
+     case: RagEvalCase
++    """对应的评测用例。"""
++
+     response: RagQueryResponse
++    """RAG 服务返回的原始响应。"""
++
+     status_match: bool
++    """RAG 返回状态是否与期望一致。"""
++
+     expected_context_hit: bool
++    """是否至少命中了一个期望的 chunk。"""
++
+     context_precision: float
++    """上下文精确率：命中的期望 chunk 占检索结果的比例（考虑排名加权）。"""
++
+     context_recall: float
++    """上下文召回率：命中的期望 chunk 占全部期望 chunk 的比例。"""
++
+     faithfulness_proxy: float
++    """忠实度代理指标：期望声明被检索内容覆盖的比例。"""
++
+     response_relevancy_proxy: float
++    """相关性代理指标：检索内容与参考答案的术语重合度。"""
++
+     score: float
++    """综合评分：加权平均五个维度。"""
++
+     retrieved_context_ids: list[str]
++    """实际检索到的 chunk ID 列表。"""
++
+     retrieved_knowledge_ids: list[str]
++    """实际检索到的知识 ID 列表。"""
+ 
+     @property
+     def passed(self) -> bool:
++        """是否通过评测。
++
++        三个条件同时满足才算通过：
++        1. status 匹配
++        2. 至少命中一个期望 chunk
++        3. 综合评分 >= 0.75
++        """
+         return self.status_match and self.expected_context_hit and self.score >= 0.75
+ 
+ 
+ @dataclass(frozen=True)
+ class RagEvalSummary:
++    """评测汇总统计。
++
++    所有指标都是各用例对应指标的平均值。
++    """
++
+     total: int
++    """用例总数。"""
++
+     passed: int
++    """通过数。"""
++
+     failed: int
++    """未通过数。"""
++
+     status_accuracy: float
++    """状态匹配准确率。"""
++
+     expected_context_hit_rate: float
++    """期望 chunk 命中率。"""
++
+     context_precision: float
++    """平均上下文精确率。"""
++
+     context_recall: float
++    """平均上下文召回率。"""
++
+     faithfulness_proxy: float
++    """平均忠实度代理指标。"""
++
+     response_relevancy_proxy: float
++    """平均相关性代理指标。"""
++
+     mean_score: float
++    """平均综合评分。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class RagEvalReport:
++    """完整的评测报告。"""
++
+     summary: RagEvalSummary
++    """汇总统计。"""
++
+     results: list[RagEvalCaseResult]
++    """每条用例的详细结果。"""
+diff --git a/apps/rag_service/app/evaluation/reporting.py b/apps/rag_service/app/evaluation/reporting.py
+index 290bf2e..0b87b05 100644
+--- a/apps/rag_service/app/evaluation/reporting.py
++++ b/apps/rag_service/app/evaluation/reporting.py
+@@ -1,3 +1,8 @@
++"""评测报告生成工具。
++
++将评测结果序列化为 JSON 文件或终端可读的摘要文本。
++"""
++
+ from __future__ import annotations
+ 
+ import json
+@@ -8,6 +13,7 @@ from apps.rag_service.app.evaluation.models import RagEvalReport
+ 
+ 
+ def report_to_dict(report: RagEvalReport) -> dict:
++    """将评测报告转为可序列化的字典。"""
+     return {
+         "summary": asdict(report.summary),
+         "results": [
+@@ -36,6 +42,7 @@ def report_to_dict(report: RagEvalReport) -> dict:
+ 
+ 
+ def write_json_report(report: RagEvalReport, path: Path | str) -> None:
++    """将评测报告写入 JSON 文件。自动创建父目录。"""
+     output_path = Path(path)
+     output_path.parent.mkdir(parents=True, exist_ok=True)
+     output_path.write_text(
+@@ -45,6 +52,7 @@ def write_json_report(report: RagEvalReport, path: Path | str) -> None:
+ 
+ 
+ def format_summary(report: RagEvalReport) -> str:
++    """格式化为终端可读的评测摘要文本。"""
+     summary = report.summary
+     return "\n".join(
+         [
+diff --git a/apps/rag_service/app/governance/gap_clustering.py b/apps/rag_service/app/governance/gap_clustering.py
+index 599675e..95bc194 100644
+--- a/apps/rag_service/app/governance/gap_clustering.py
++++ b/apps/rag_service/app/governance/gap_clustering.py
+@@ -1,3 +1,15 @@
++"""知识缺口聚类服务。
++
++将相似的 "未命中/低置信度" 查询事件分组为缺口集群，帮助运营团队发现知识盲区。
++
++聚类算法：
++1. 获取未聚类的缺口事件 + 现有的 open 集群。
++2. 用 Embedding API 将所有文本向量化。
++3. 对每个新事件，计算与已有集群质心的余弦相似度。
++4. 相似度 >= threshold → 归入已有集群（增量合并）；否则 → 创建新集群。
++5. 用 Chat API 为集群生成标题和摘要。
++"""
++
+ from __future__ import annotations
+ 
+ import json
+@@ -11,15 +23,20 @@ from apps.rag_service.app.storage.repository import KnowledgeGapClusterRecord, n
+ 
+ 
+ class EmbeddingClient(Protocol):
++    """Embedding 能力的 Protocol 接口，不依赖具体实现。"""
++
+     def embed_texts(self, texts: list[str]): ...
+ 
+ 
+ class ClusterSummaryClient(Protocol):
++    """Cluster 摘要生成能力的 Protocol 接口，不依赖具体实现。"""
++
+     def complete_json(self, system_prompt: str, user_prompt: str): ...
+ 
+ 
+ @dataclass(frozen=True)
+ class GapClusterCandidate:
++    """聚类过程中的一个候选集群（新建或待更新）。"""
+     cluster_id: str
+     event_ids: list[str]
+     representative_query: str
+@@ -46,6 +63,12 @@ class GapClusteringResult:
+ 
+ 
+ class GapClusteringService:
++    """知识缺口聚类服务。
++
++    核心方法 ``cluster_unassigned_events`` 执行一次增量聚类：
++    处理尚未分配的缺口事件，将其归入已有集群或创建新集群。
++    """
++
+     def __init__(
+         self,
+         repository,
+@@ -54,6 +77,15 @@ class GapClusteringService:
+         similarity_threshold: float = 0.82,
+         max_examples: int = 5,
+     ) -> None:
++        """初始化聚类服务。
++
++        Args:
++            repository: MetadataRepository 实例。
++            embedding_client: Embedding 客户端，用于将查询文本向量化。
++            summary_client: Chat 客户端（可选），用于生成集群标题和摘要。None 则用 fallback。
++            similarity_threshold: 归入同一集群的最低余弦相似度（默认 0.82）。
++            max_examples: 每个集群保存的查询示例数上限。
++        """
+         self.repository = repository
+         self.embedding_client = embedding_client
+         self.summary_client = summary_client
+@@ -61,6 +93,22 @@ class GapClusteringService:
+         self.max_examples = max_examples
+ 
+     def cluster_unassigned_events(self, limit: int = 100, dry_run: bool = False) -> GapClusteringResult:
++        """执行一次增量聚类。
++
++        流程：
++        1. 获取未聚类事件 + 已有 open 集群。
++        2. 全部文本向量化。
++        3. 对新事件按余弦相似度进行贪心匹配 → 归入已有集群或新建集群。
++        4. 用 Chat API 为集群生成标题和摘要。
++        5. 持久化：插入/更新集群 + 分配事件归属。
++
++        Args:
++            limit: 最多处理多少条未聚类事件。
++            dry_run: True 时只计算不写入数据库。
++
++        Returns:
++            GapClusteringResult: 本次聚类的处理统计和结果列表。
++        """
+         events = self.repository.list_unclustered_gap_events(limit)
+         if not events:
+             return GapClusteringResult(0, 0, 0, 0, [])
+diff --git a/apps/rag_service/app/ingestion/embedding_text.py b/apps/rag_service/app/ingestion/embedding_text.py
+index bb85681..7ddcb4b 100644
+--- a/apps/rag_service/app/ingestion/embedding_text.py
++++ b/apps/rag_service/app/ingestion/embedding_text.py
+@@ -1,9 +1,35 @@
++"""Embedding 文本构造。
++
++将知识条目的各字段拼接为一条可供向量化的文本。
++拼接格式与 ``docs/knowledge_format_v0.1.md`` 中定义一致。
++"""
++
+ from __future__ import annotations
+ 
+ from apps.rag_service.app.ingestion.models import KnowledgeItem
+ 
+ 
+ def build_embedding_text(item: KnowledgeItem) -> str:
++    """将一条知识条目拼接为 embedding 输入文本。
++
++    参与 embedding 的字段（按拼接顺序）：
++    1. 标题
++    2. 业务域
++    3. 知识类型
++    4. 摘要
++    5. 关键词（可选，顿号连接）
++    6. 相似问法（可选，分号连接）
++    7. 正文
++    8. 允许表达（可选，分号连接）
++
++    注意：forbiddenClaims 不参与 embedding，仅作为安全约束返回给 Agent。
++
++    Args:
++        item: 待向量化的知识条目。
++
++    Returns:
++        拼接后的文本字符串。末尾的空字符串会被过滤掉。
++    """
+     parts: list[str] = [
+         f"标题：{item.title}",
+         f"业务域：{item.business_domain or ''}",
+diff --git a/apps/rag_service/app/ingestion/markdown_parser.py b/apps/rag_service/app/ingestion/markdown_parser.py
+index 53822a3..d175f7b 100644
+--- a/apps/rag_service/app/ingestion/markdown_parser.py
++++ b/apps/rag_service/app/ingestion/markdown_parser.py
+@@ -1,3 +1,14 @@
++"""Markdown 知识库解析器。
++
++将 ``knowledge/`` 目录下的 Markdown 文件解析为结构化的 KnowledgeDocument。
++解析约定：
++- YAML front matter 作为文档级元信息（``---`` 包裹）。
++- 一级标题（``#``）作为文档标题。
++- 二级标题（``## knowledgeId｜标题``）作为知识条目，用 ``|`` 或 ``｜`` 分隔 ID 和标题。
++- 三级标题（``###``）作为条目内的区块（Summary、Content、Keywords 等）。
++- Eval Questions 区块为 JSON 数组格式的评测问题列表。
++"""
++
+ from __future__ import annotations
+ 
+ import json
+@@ -9,31 +20,71 @@ import yaml
+ 
+ from .models import EvalQuestion, KnowledgeDocument, KnowledgeItem, ValidationIssue
+ 
++# ── 正则表达式 ───────────────────────────────────────────────
++
+ FRONT_MATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.S)
++"""匹配 YAML front matter：文件开头的 ``---`` 到 ``---`` 之间的内容。"""
++
+ KNOWLEDGE_HEADING_RE = re.compile(r"^##\s+([^|｜\s]+)\s*[|｜]\s*(.+?)\s*$", re.M)
++"""匹配知识条目标题：``## knowledgeId｜标题``。支持中英文竖线。"""
++
+ SECTION_HEADING_RE = re.compile(r"^###\s+(.+?)\s*$", re.M)
++"""匹配三级标题：``### Section Name``。"""
++
+ DOCUMENT_TITLE_RE = re.compile(r"^#\s+(.+?)\s*$", re.M)
++"""匹配文档一级标题：``# Document Title``。"""
++
++# ── 三级标题的别名映射 ──────────────────────────────────────
+ 
+ SECTION_ALIASES = {
++    # Summary
+     "summary": "Summary",
+     "摘要": "Summary",
++    # Content
+     "content": "Content",
+     "正文": "Content",
++    # Allowed Claims
+     "allowed claims": "Allowed Claims",
+     "允许表达": "Allowed Claims",
++    # Forbidden Claims
+     "forbidden claims": "Forbidden Claims",
+     "禁止表达": "Forbidden Claims",
++    # Keywords
+     "keywords": "Keywords",
+     "关键词": "Keywords",
++    # Similar Questions
+     "similar questions": "Similar Questions",
+     "相似问法": "Similar Questions",
++    # Eval Questions
+     "eval questions": "Eval Questions",
+     "评测问题": "Eval Questions",
+ }
++"""三级标题的中英文别名映射。编辑器可能使用中文或英文标题，此处统一为规范名称。"""
+ 
+ 
+ class KnowledgeMarkdownParser:
++    """Markdown 知识库解析器。
++
++    负责：
++    1. 遍历知识库目录，找到所有 .md 文件。
++    2. 解析每个文件：提取 YAML front matter、文档标题、知识条目。
++    3. 将三级标题区块映射到 KnowledgeItem 的对应字段。
++    4. 解析 Eval Questions 的 JSON 数组。
++    """
++
+     def parse_directory(self, base_dir: Path | str) -> tuple[list[KnowledgeDocument], list[ValidationIssue]]:
++        """解析整个知识库目录。
++
++        递归查找所有 .md 文件，逐个解析，汇总文档和校验问题。
++
++        Args:
++            base_dir: 知识库根目录路径。
++
++        Returns:
++            (documents, issues) 元组。
++            documents: 成功解析的文档（解析失败的文件不会出现在此列表中）。
++            issues: 所有文件的解析和校验问题。
++        """
+         base_path = Path(base_dir)
+         documents: list[KnowledgeDocument] = []
+         issues: list[ValidationIssue] = []
+@@ -45,6 +96,20 @@ class KnowledgeMarkdownParser:
+         return documents, issues
+ 
+     def parse_file(self, path: Path | str) -> tuple[KnowledgeDocument | None, list[ValidationIssue]]:
++        """解析单个 Markdown 文件。
++
++        流程：
++        1. 按 UTF-8 with BOM 编码读取。
++        2. 提取 YAML front matter。
++        3. 提取一级标题作为文档标题。
++        4. 遍历二级标题，解析每个知识条目的三级标题区块。
++
++        Args:
++            path: Markdown 文件路径。
++
++        Returns:
++            (document, issues) 元组。如果 YAML front matter 缺失则 document 为 None。
++        """
+         file_path = Path(path)
+         issues: list[ValidationIssue] = []
+         text = file_path.read_text(encoding="utf-8-sig")
+@@ -66,6 +131,10 @@ class KnowledgeMarkdownParser:
+         path: Path,
+         issues: list[ValidationIssue],
+     ) -> dict[str, Any]:
++        """解析 YAML front matter 为字典。
++
++        解析失败时记录 error 并返回空字典。
++        """
+         try:
+             data = yaml.safe_load(front_matter) or {}
+         except yaml.YAMLError as exc:
+@@ -83,6 +152,12 @@ class KnowledgeMarkdownParser:
+         metadata: dict[str, Any],
+         issues: list[ValidationIssue],
+     ) -> list[KnowledgeItem]:
++        """解析正文中所有知识条目。
++
++        用 ``## knowledgeId｜标题`` 正则匹配所有二级标题，
++        每个标题之间的内容作为一个知识条目区块。
++        条目区块内再按三级标题解析各字段。
++        """
+         headings = list(KNOWLEDGE_HEADING_RE.finditer(body))
+         items: list[KnowledgeItem] = []
+         if not headings:
+@@ -121,6 +196,11 @@ class KnowledgeMarkdownParser:
+         return items
+ 
+     def _parse_sections(self, block: str) -> dict[str, str]:
++        """将知识条目区块按三级标题切分为字段字典。
++
++        每个 ``### 标题`` 之间的内容归入该标题对应的字段。
++        标题名称通过 SECTION_ALIASES 映射为规范名。
++        """
+         matches = list(SECTION_HEADING_RE.finditer(block))
+         sections: dict[str, str] = {}
+         for index, match in enumerate(matches):
+diff --git a/apps/rag_service/app/ingestion/models.py b/apps/rag_service/app/ingestion/models.py
+index dfc2f29..03ab0b5 100644
+--- a/apps/rag_service/app/ingestion/models.py
++++ b/apps/rag_service/app/ingestion/models.py
+@@ -1,3 +1,8 @@
++"""知识摄取（Ingestion）的数据模型。
++
++定义了从 Markdown 文件解析到入库校验全链路的数据结构。
++"""
++
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field
+@@ -5,83 +10,174 @@ from pathlib import Path
+ from typing import Any, Literal
+ 
+ IssueLevel = Literal["error", "warning"]
++"""校验问题的严重等级。error 会阻止入库，warning 不会。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class EvalQuestion:
++    """内嵌在知识条目中的评测问题。
++
++    从 Markdown 的 ``### Eval Questions`` 区块的 JSON 数组解析而来。
++    每个评测问题定义了一条测试用例：用什么 query 查、期望命中哪个 chunk。
++    """
++
+     question: str
++    """测试查询文本。"""
++
+     reference_answer: str
++    """参考答案，用于评测忠实度。"""
++
+     expected_context_ids: list[str]
++    """期望检索命中的 chunk ID 列表。"""
++
+     expected_status: str
++    """期望的 RAG 状态，如 ``success``、``not_found``。"""
++
+     expected_claims: list[str]
++    """期望检索结果中包含的关键声明。"""
++
+     negative_context_ids: list[str] = field(default_factory=list)
++    """不应出现在检索结果中的 chunk ID。"""
++
+     notes: str | None = None
++    """评测备注。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class KnowledgeDocument:
++    """从单个 Markdown 文件解析出的知识文档。
++
++    一个文件对应一个文档，包含 YAML front matter 元信息和若干知识条目。
++    """
++
+     path: Path
++    """文件的绝对路径。"""
++
+     metadata: dict[str, Any]
++    """YAML front matter 中解析出的文档级元信息。"""
++
+     title: str | None
++    """文档一级标题（# 开头）。"""
++
+     items: list[KnowledgeItem]
++    """文档中的知识条目列表，每个二级标题（## 开头）对应一条。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class KnowledgeItem:
++    """单条知识，对应 Markdown 中一个 ## 二级标题区块。
++
++    每个区块包含摘要、正文、允许/禁止表达、关键词、相似问法等字段。
++    chunk_id 约定为 ``{knowledgeId}#main``，表示为该知识的主 chunk。
++    """
++
+     knowledge_id: str
++    """知识条目唯一 ID，来自二级标题中 ``|`` 之前的部分，如 ``faq_charge_scan_001``。"""
++
+     chunk_id: str
++    """chunk ID，约定为 ``{knowledgeId}#main``。第一版每条知识只有一个 chunk。"""
++
+     title: str
++    """知识标题，来自二级标题中 ``|`` 之后的部分。"""
++
+     summary: str
++    """知识摘要，用于快速理解和在 rerank 中作为关键字段。"""
++
+     content: str
++    """知识正文，Agent 组织回复的参考依据。"""
++
+     allowed_claims: list[str]
++    """允许表达列表：Agent 可以使用的、经过审核的陈述句。"""
++
+     forbidden_claims: list[str]
++    """禁止表达列表：Agent 不得使用的陈述句，用于高风险知识的红线性约束。"""
++
+     keywords: list[str]
++    """关键词列表，用于文本信号评分和 embedding 增强。"""
++
+     similar_questions: list[str]
++    """相似问法列表，用于文本信号评分和 FAQ 类知识的检索增强。"""
++
+     eval_questions: list[EvalQuestion]
++    """内嵌的评测问题列表。"""
++
+     source_path: Path
++    """来源 Markdown 文件的路径。"""
++
+     document_metadata: dict[str, Any]
++    """来源文档的 YAML front matter 元信息。"""
++
++    # ── 派生属性 ─────────────────────────────────────────────
+ 
+     @property
+     def business_domain(self) -> str | None:
++        """从文档元信息中提取业务域，如 ``charging``、``refund``。"""
+         value = self.document_metadata.get("businessDomain")
+         return str(value) if value is not None else None
+ 
+     @property
+     def knowledge_type(self) -> str | None:
++        """从文档元信息中提取知识类型，如 ``faq``、``refund_policy``。"""
+         value = self.document_metadata.get("knowledgeType")
+         return str(value) if value is not None else None
+ 
+     @property
+     def risk_level(self) -> str:
++        """从文档元信息中提取风险等级，默认 ``medium``。
++
++        影响检索行为：高风险知识必须有 forbiddenClaims。
++        """
+         value = self.document_metadata.get("riskLevel") or "medium"
+         return str(value)
+ 
+ 
+ @dataclass(frozen=True)
+ class ValidationIssue:
++    """知识校验过程中发现的一个问题。"""
++
+     level: IssueLevel
++    """问题级别：error 或 warning。"""
++
+     path: Path
++    """问题所在的文件路径。"""
++
+     message: str
++    """问题描述。"""
++
+     knowledge_id: str | None = None
++    """问题关联的知识 ID（如适用）。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class ValidationReport:
++    """知识校验的完整报告。
++
++    包含解析出的所有文档和校验过程中发现的问题。
++    通过属性方法提供便捷的统计和判断。
++    """
++
+     documents: list[KnowledgeDocument]
++    """校验通过（或仅有 warning）的文档。"""
++
+     issues: list[ValidationIssue]
++    """所有校验问题（含 error 和 warning）。"""
+ 
+     @property
+     def errors(self) -> list[ValidationIssue]:
++        """仅返回 error 级别的问题。"""
+         return [issue for issue in self.issues if issue.level == "error"]
+ 
+     @property
+     def warnings(self) -> list[ValidationIssue]:
++        """仅返回 warning 级别的问题。"""
+         return [issue for issue in self.issues if issue.level == "warning"]
+ 
+     @property
+     def item_count(self) -> int:
++        """所有文档中的知识条目总数。"""
+         return sum(len(document.items) for document in self.documents)
+ 
+     @property
+     def ok(self) -> bool:
++        """校验是否通过：无 error 则视为通过。"""
+         return not self.errors
+diff --git a/apps/rag_service/app/ingestion/validator.py b/apps/rag_service/app/ingestion/validator.py
+index fc19ca9..4c9ffc0 100644
+--- a/apps/rag_service/app/ingestion/validator.py
++++ b/apps/rag_service/app/ingestion/validator.py
+@@ -1,3 +1,12 @@
++"""知识校验器。
++
++在校验 Markdown 解析结果的基础上，验证每份文档和每条知识条目的
++完整性、格式正确性和合规性。校验规则覆盖：
++
++- 文档级：必填元信息、业务域/知识类型白名单、日期格式、风险等级。
++- 条目级：knowledgeId 格式、摘要/正文长度、必填声明、风险评估。
++"""
++
+ from __future__ import annotations
+ 
+ import re
+@@ -7,6 +16,8 @@ from typing import Any
+ 
+ from .models import KnowledgeDocument, KnowledgeItem, ValidationIssue, ValidationReport
+ 
++# ── 白名单 ───────────────────────────────────────────────────
++
+ BUSINESS_DOMAINS = {
+     "charging",
+     "device",
+@@ -20,6 +31,7 @@ BUSINESS_DOMAINS = {
+     "customer_service",
+     "general",
+ }
++"""合法的业务域。不在白名单内的值会导致校验错误。"""
+ 
+ KNOWLEDGE_TYPES = {
+     "faq",
+@@ -32,9 +44,14 @@ KNOWLEDGE_TYPES = {
+     "service_rule",
+     "risk_notice",
+ }
++"""合法的知识类型。不在白名单内的值会导致校验错误。"""
+ 
+ RISK_LEVELS = {"low", "medium", "high", "critical"}
++"""合法的风险等级。critical 级别在 v1 不允许 active。"""
++
+ STATUSES = {"draft", "reviewing", "active", "disabled", "expired", "archived"}
++"""合法的知识状态。只有 active 且在有效期内的知识参与检索。"""
++
+ REQUIRED_METADATA = {
+     "docId",
+     "docTitle",
+@@ -46,16 +63,30 @@ REQUIRED_METADATA = {
+     "updatedAt",
+     "reviewDueAt",
+ }
++"""文档 front matter 中必须填写的字段。"""
++
+ KNOWLEDGE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*[0-9]{3}$")
++"""knowledgeId 格式：小写字母开头，字母/数字/下划线，三位数字结尾，如 ``faq_charge_scan_001``。"""
++
+ HIGH_RISK_TYPES = {"billing_policy", "refund_policy", "coupon_policy", "risk_notice"}
++"""高风险的 knowledgeType 集合。这些类型默认 riskLevel=high，且必须有 forbiddenClaims。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class ValidationOptions:
++    """校验选项。控制校验的严格程度。"""
++
+     require_eval_questions: bool = False
++    """是否强制要求每个条目都有 Eval Questions。评测/Mock 数据集场景下开启。"""
+ 
+ 
+ class KnowledgeValidator:
++    """知识校验器。
++
++    对解析出的文档和条目执行全面的格式和完整性校验。
++    校验结果分为 error（阻止入库）和 warning（不阻止但建议修复）。
++    """
++
+     def validate(
+         self,
+         documents: list[KnowledgeDocument],
+diff --git a/apps/rag_service/app/main.py b/apps/rag_service/app/main.py
+index aaf6e48..5752d02 100644
+--- a/apps/rag_service/app/main.py
++++ b/apps/rag_service/app/main.py
+@@ -1,3 +1,9 @@
++"""RAG 服务应用入口。
++
++创建 FastAPI 应用实例，注册路由。生产环境通过 uvicorn 启动：
++``uvicorn apps.rag_service.app.main:app --host 0.0.0.0 --port 8100``
++"""
++
+ from __future__ import annotations
+ 
+ from fastapi import FastAPI
+@@ -6,9 +12,14 @@ from apps.rag_service.app.api.routes import router
+ 
+ 
+ def create_app() -> FastAPI:
++    """创建并配置 FastAPI 应用。
++
++    使用工厂函数模式，便于测试时创建独立的 app 实例。
++    """
+     app = FastAPI(title="Dalizai Knowledge RAG Service", version="0.1.0")
+     app.include_router(router)
+     return app
+ 
+ 
++# 模块级 app 实例，uvicorn 通过 ``main:app`` 引用
+ app = create_app()
+diff --git a/apps/rag_service/app/privacy/masking.py b/apps/rag_service/app/privacy/masking.py
+index 907b812..0e885eb 100644
+--- a/apps/rag_service/app/privacy/masking.py
++++ b/apps/rag_service/app/privacy/masking.py
+@@ -1,17 +1,48 @@
++"""\u67e5\u8be2\u6587\u672c\u8131\u654f\u548c\u6807\u8bc6\u7b26\u54c8\u5e0c\u3002
++
++\u5728\u5199\u5165\u5ba1\u8ba1\u65e5\u5fd7\u524d\uff0c\u5bf9\u53ef\u80fd\u5305\u542b\u4e2a\u4eba\u8eab\u4efd\u4fe1\u606f\uff08PII\uff09\u7684\u5b57\u6bb5\u8fdb\u884c\u5904\u7406\uff1a
++- ``mask_text``: \u7528\u5360\u4f4d\u7b26\u66ff\u6362\u5339\u914d\u5230 PII \u6a21\u5f0f\u7684\u6587\u672c\u7247\u6bb5\u3002
++- ``hash_identifier``: \u5bf9 sessionId/userId \u505a SHA-256 \u54c8\u5e0c + salt\uff0c\u652f\u6301\u53bb\u91cd\u5206\u6790\u4f46\u4e0d\u53ef\u9006\u3002
++"""
++
+ from __future__ import annotations
+ 
+ import hashlib
+ import re
+ 
++# \u2500\u2500 PII \u6b63\u5219\u8868\u8fbe\u5f0f \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
++
+ PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
++"""\u4e2d\u56fd\u5927\u9646\u624b\u673a\u53f7\uff0811 \u4f4d\uff0c1 \u5f00\u5934\uff09\u3002"""
++
+ ID_CARD_RE = re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)")
++"""\u4e2d\u56fd\u5927\u9646\u8eab\u4efd\u8bc1\u53f7\uff0818 \u4f4d\uff0c\u672b\u4f4d\u53ef\u4ee5\u662f\u6570\u5b57\u6216 X\uff09\u3002"""
++
+ EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
++"""\u7535\u5b50\u90ae\u7bb1\u5730\u5740\u3002"""
++
+ ORDER_RE = re.compile(r"(?<![A-Za-z0-9])(?:ORDER|order|ORD|ord|NO|no)[-_]?[A-Za-z0-9]{6,}(?![A-Za-z0-9])")
++"""\u8ba2\u5355\u7f16\u53f7\uff08ORDER/ord/NO/no \u524d\u7f00 + 6 \u4f4d\u4ee5\u4e0a\u5b57\u6bcd\u6570\u5b57\uff09\u3002"""
++
+ LONG_NUMBER_RE = re.compile(r"(?<!\d)\d{10,}(?!\d)")
++"""\u957f\u6570\u5b57\u4e32\uff0810 \u4f4d\u4ee5\u4e0a\uff09\uff0c\u53ef\u80fd\u662f\u94f6\u884c\u5361\u53f7\u7b49\u3002"""
++
+ PLATE_RE = re.compile(r"[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}")
++"""\u4e2d\u56fd\u5927\u9646\u8f66\u724c\u53f7\uff08\u7701\u4efd\u7b80\u79f0 + \u5b57\u6bcd + 5-6 \u4f4d\uff09\u3002"""
+ 
+ 
+ def mask_text(text: str | None) -> str | None:
++    """\u5bf9\u6587\u672c\u4e2d\u7684 PII \u8fdb\u884c\u5360\u4f4d\u7b26\u66ff\u6362\u3002
++
++    \u5339\u914d\u7c7b\u578b\uff1a\u624b\u673a\u53f7\u3001\u8eab\u4efd\u8bc1\u53f7\u3001\u90ae\u7bb1\u3001\u8ba2\u5355\u7f16\u53f7\u3001\u8f66\u724c\u53f7\u3001\u957f\u6570\u5b57\u4e32\u3002
++    \u66ff\u6362\u540e\u7684\u5360\u4f4d\u7b26\u4f8b\u5982 ``[PHONE]``\u3001``[ID_CARD]`` \u7b49\u3002
++
++    Args:
++        text: \u9700\u8981\u8131\u654f\u7684\u539f\u59cb\u6587\u672c\u3002
++
++    Returns:
++        \u8131\u654f\u540e\u7684\u6587\u672c\u3002\u8f93\u5165\u4e3a None \u65f6\u8fd4\u56de None\u3002
++    """
+     if text is None:
+         return None
+     masked = PHONE_RE.sub("[PHONE]", text)
+@@ -24,6 +55,20 @@ def mask_text(text: str | None) -> str | None:
+ 
+ 
+ def hash_identifier(value: str | None, salt: str) -> str | None:
++    """对标识符进行加盐 SHA-256 哈希。
++
++    使用 ``sha256(salt + ":" + value)`` 的方式保证：
++    - 同一标识符在不同 salt 下产生不同哈希（防止跨服务关联）。
++    - 同一 salt 下同一标识符始终产生相同哈希（支持去重和计数分析）。
++    - 不可逆（无法从哈希还原原始值）。
++
++    Args:
++        value: 待哈希的原始标识符。
++        salt: 盐值，使用 RAG_SERVICE_API_KEY 作为 salt。
++
++    Returns:
++        hex 格式的哈希字符串。输入为 None 或空字符串时返回 None。
++    """
+     if value is None or value == "":
+         return None
+     digest = hashlib.sha256(f"{salt}:{value}".encode("utf-8")).hexdigest()
+diff --git a/apps/rag_service/app/providers/dashscope.py b/apps/rag_service/app/providers/dashscope.py
+index 0567432..2985004 100644
+--- a/apps/rag_service/app/providers/dashscope.py
++++ b/apps/rag_service/app/providers/dashscope.py
+@@ -1,3 +1,14 @@
++"""DashScope（阿里云灵积）模型服务 Provider。
++
++通过 DashScope 兼容模式 API 提供三类模型服务：
++- ``DashScopeEmbeddingClient``: 文本向量化（embedding），将知识/查询文本转为稠密向量。
++- ``DashScopeRerankClient``: 重排序（rerank），对召回候选按与查询的相关性重新打分排序。
++- ``DashScopeChatClient``: 对话补全（chat completion），用于 query rewrite 和缺口聚类摘要生成。
++
++三个 client 共享同一套 Settings 和 HTTP 错误处理策略（``_handle_response`` / ``_extract_error_message``）。
++第一版默认使用 DashScope 云 API，代码层保留 provider 抽象，后续可切换为本地模型。
++"""
++
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+@@ -10,32 +21,85 @@ from .models import ChatCompletionResult, EmbeddingResult, RerankDocument, Reran
+ 
+ @dataclass(frozen=True)
+ class DashScopeSettings:
++    """DashScope 模型服务的连接配置。
++
++    三个 client 共享同一组配置。api_key 和 base_url 对所有服务通用，
++    embedding/rerank/chat 使用不同的模型名称。
++    """
++
+     api_key: str
++    """DashScope API Key，通过 HTTP Authorization: Bearer 头传递。"""
++
+     embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
++    """Embedding 兼容模式 API 基础地址，对齐 OpenAI API 格式。"""
++
+     rerank_base_url: str = "https://dashscope.aliyuncs.com/compatible-api/v1"
++    """Rerank 兼容 API 基础地址。"""
++
+     chat_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
++    """Chat Completion 兼容模式 API 基础地址，对齐 OpenAI API 格式。"""
++
+     embedding_model: str = "qwen3.7-text-embedding"
++    """Embedding 模型名称。输出 1024 维向量。"""
++
+     embedding_dimension: int = 1024
++    """Embedding 输出维度，用于校验 API 返回值和创建 Qdrant collection。"""
++
+     rerank_model: str = "qwen3-rerank"
++    """Rerank 模型名称。支持 QA 模式。"""
++
+     chat_model: str = "qwen-turbo"
++    """Chat 模型名称，用于 query rewrite 和缺口摘要（轻量模型即可）。"""
++
+     timeout_seconds: float = 60.0
++    """HTTP 请求超时时间（秒）。"""
+ 
+ 
+ class DashScopeEmbeddingClient:
++    """DashScope Embedding 客户端。
++
++    将文本列表转为稠密向量，通过兼容模式 API（对齐 OpenAI Embeddings API）调用。
++    支持批量请求，ingest 脚本中以 batch=20 分批调用。
++    """
++
+     def __init__(
+         self,
+         settings: DashScopeSettings,
+         http_client: httpx.Client | None = None,
+     ) -> None:
++        """初始化 Embedding 客户端。
++
++        Args:
++            settings: DashScope 连接配置。
++            http_client: 可选的自定义 httpx.Client，用于测试时注入 mock。
++        """
+         self.settings = settings
+         self._client = http_client or httpx.Client(timeout=settings.timeout_seconds)
+         self._owns_client = http_client is None
++        """是否由本实例创建了 http_client，关闭时需要判断。"""
+ 
+     def close(self) -> None:
++        """关闭 HTTP 客户端。仅当客户端由本实例创建时才关闭。"""
+         if self._owns_client:
+             self._client.close()
+ 
+     def embed_texts(self, texts: list[str]) -> EmbeddingResult:
++        """将文本列表向量化。
++
++        Args:
++            texts: 待向量化的文本列表，不能为空。
++
++        Returns:
++            EmbeddingResult: 包含向量列表、模型名称、维度和用量。
++
++        Raises:
++            ModelProviderBadRequestError: texts 为空。
++            ModelProviderError: 返回的向量数量或维度不正确。
++
++        校验逻辑：
++        1. 返回向量数 == 输入文本数。
++        2. 每个向量维度 == 配置中的 embedding_dimension。
++        """
+         if not texts:
+             raise ModelProviderBadRequestError("texts cannot be empty")
+         response = self._client.post(
+@@ -66,12 +130,31 @@ class DashScopeEmbeddingClient:
+         )
+ 
+     def _headers(self) -> dict[str, str]:
++        """构建 HTTP 请求头。使用 Bearer Token 鉴权。"""
+         return {
+             "Authorization": f"Bearer {self.settings.api_key}",
+             "Content-Type": "application/json",
+         }
+ 
+     def _handle_response(self, response: httpx.Response) -> dict:
++        """统一的 HTTP 响应处理。
++
++        按状态码分类处理错误：
++        - 401/403: 鉴权失败 → ModelProviderAuthError（不可重试）
++        - 400-499: 请求参数错误 → ModelProviderBadRequestError（不可重试）
++        - 500+: 服务端错误 → ModelProviderError（可重试）
++
++        Args:
++            response: httpx 响应对象。
++
++        Returns:
++            解析后的 JSON 字典。
++
++        Raises:
++            ModelProviderAuthError: 鉴权失败。
++            ModelProviderBadRequestError: 请求参数错误。
++            ModelProviderError: 服务端临时故障。
++        """
+         if response.status_code in {401, 403}:
+             raise ModelProviderAuthError()
+         if 400 <= response.status_code < 500:
+@@ -88,6 +171,11 @@ class DashScopeEmbeddingClient:
+         return response.json()
+ 
+     def _extract_error_message(self, response: httpx.Response) -> str:
++        """从 HTTP 错误响应中提取人类可读的错误信息。
++
++        兼容多种 API 错误格式（OpenAI 兼容格式、DashScope 原生格式），
++        兜底返回响应体前 300 字符。
++        """
+         try:
+             data = response.json()
+         except ValueError:
+@@ -101,16 +189,32 @@ class DashScopeEmbeddingClient:
+ 
+ 
+ class DashScopeRerankClient:
++    """DashScope Rerank 客户端。
++
++    对召回候选文档按与查询的相关性重新排序。
++    输入 query + documents，返回按相关性降序排列的结果列表。
++
++    输出中的 index 对应输入 documents 列表的下标，
++    通过 documents[index].id 关联回原始 chunk。
++    """
++
+     def __init__(
+         self,
+         settings: DashScopeSettings,
+         http_client: httpx.Client | None = None,
+     ) -> None:
++        """初始化 Rerank 客户端。
++
++        Args:
++            settings: DashScope 连接配置。
++            http_client: 可选的自定义 httpx.Client，用于测试时注入 mock。
++        """
+         self.settings = settings
+         self._client = http_client or httpx.Client(timeout=settings.timeout_seconds)
+         self._owns_client = http_client is None
+ 
+     def close(self) -> None:
++        """关闭 HTTP 客户端。"""
+         if self._owns_client:
+             self._client.close()
+ 
+@@ -120,10 +224,27 @@ class DashScopeRerankClient:
+         documents: list[RerankDocument],
+         top_n: int | None = None,
+     ) -> list[RerankResult]:
++        """对文档列表重新排序。
++
++        Args:
++            query: 查询文本（已 rewrite 后的检索句）。
++            documents: 候选文档列表，来自 Qdrant 的首次召回结果。
++            top_n: 返回的前 N 条结果数。默认返回全部。
++
++        Returns:
++            按相关性分数降序排列的结果列表。
++
++        Raises:
++            ModelProviderBadRequestError: query 为空。
++            ModelProviderError: API 返回格式异常或结果索引越界。
++
++        注意：返回空列表如果 documents 为空 — 不视为错误。
++        """
+         if not query.strip():
+             raise ModelProviderBadRequestError("query cannot be empty")
+         if not documents:
+             return []
++        # 调用 DashScope Rerank API（兼容模式，非 OpenAI 格式）
+         response = self._client.post(
+             f"{self.settings.rerank_base_url.rstrip('/')}/reranks",
+             headers=self._headers(),
+@@ -147,6 +268,7 @@ class DashScopeRerankClient:
+                 raise ModelProviderError("Invalid rerank result item", retryable=True)
+             if index < 0 or index >= len(documents):
+                 raise ModelProviderError("Rerank result index out of range", retryable=True)
++            # 通过 index 关联回原始 document 的 id（chunkId）
+             results.append(
+                 RerankResult(
+                     id=documents[index].id,
+@@ -192,20 +314,48 @@ class DashScopeRerankClient:
+ 
+ 
+ class DashScopeChatClient:
++    """DashScope Chat Completion 客户端。
++
++    用于需要 LLM 推理的轻量任务：Query Rewrite 和知识缺口聚类摘要。
++    强制使用 JSON 模式输出（``response_format: json_object``），
++    temperature=0.2 以保证输出的一致性和可解析性。
++    """
++
+     def __init__(
+         self,
+         settings: DashScopeSettings,
+         http_client: httpx.Client | None = None,
+     ) -> None:
++        """初始化 Chat 客户端。
++
++        Args:
++            settings: DashScope 连接配置。
++            http_client: 可选的自定义 httpx.Client，用于测试时注入 mock。
++        """
+         self.settings = settings
+         self._client = http_client or httpx.Client(timeout=settings.timeout_seconds)
+         self._owns_client = http_client is None
+ 
+     def close(self) -> None:
++        """关闭 HTTP 客户端。"""
+         if self._owns_client:
+             self._client.close()
+ 
+     def complete_json(self, system_prompt: str, user_prompt: str) -> ChatCompletionResult:
++        """调用 Chat Completion API，返回 JSON 格式的输出。
++
++        使用 low temperature (0.2) + JSON mode 保证输出格式稳定。
++
++        Args:
++            system_prompt: 系统提示词，定义任务角色和输出格式约束。
++            user_prompt: 用户提示词，包含具体的输入数据（JSON 字符串）。
++
++        Returns:
++            ChatCompletionResult: 模型输出内容（content 字段为 JSON 字符串，需调用方解析）。
++
++        Raises:
++            ModelProviderError: API 返回为空或格式不正确。
++        """
+         response = self._client.post(
+             f"{self.settings.chat_base_url.rstrip('/')}/chat/completions",
+             headers=self._headers(),
+diff --git a/apps/rag_service/app/providers/errors.py b/apps/rag_service/app/providers/errors.py
+index 3511921..cc1ea84 100644
+--- a/apps/rag_service/app/providers/errors.py
++++ b/apps/rag_service/app/providers/errors.py
+@@ -1,7 +1,26 @@
++"""模型服务 Provider 的异常类型。
++
++定义了三层异常，帮助调用方判断错误的可恢复性：
++- 鉴权错误：不可重试，需要修复 API Key 配置。
++- 请求错误：不可重试，需要修复请求参数。
++- 通用服务错误：可重试，可能是临时故障。
++"""
++
+ from __future__ import annotations
+ 
+ 
+ class ModelProviderError(RuntimeError):
++    """模型服务通用错误基类。
++
++    所有与模型服务交互（embedding / rerank / chat）相关的异常
++    都继承自此基类。
++
++    Attributes:
++        retryable: 是否建议调用方重试。True 表示可能是临时故障，
++                    False 表示需要修复配置或参数后方可重试。
++        status_code: HTTP 状态码，可能为 None。
++    """
++
+     def __init__(self, message: str, *, retryable: bool = True, status_code: int | None = None) -> None:
+         super().__init__(message)
+         self.retryable = retryable
+@@ -9,10 +28,22 @@ class ModelProviderError(RuntimeError):
+ 
+ 
+ class ModelProviderAuthError(ModelProviderError):
++    """模型服务鉴权失败错误。
++
++    通常由 HTTP 401/403 触发，表示 API Key 无效或过期。
++    不可重试，需要更新 API Key 配置。
++    """
++
+     def __init__(self, message: str = "Model provider authentication failed") -> None:
+         super().__init__(message, retryable=False, status_code=401)
+ 
+ 
+ class ModelProviderBadRequestError(ModelProviderError):
++    """模型服务请求参数错误。
++
++    通常由 HTTP 4xx（非鉴权类）触发，表示请求格式或参数不合法。
++    不可重试，需要修复请求参数。
++    """
++
+     def __init__(self, message: str, *, status_code: int | None = 400) -> None:
+         super().__init__(message, retryable=False, status_code=status_code)
+diff --git a/apps/rag_service/app/providers/models.py b/apps/rag_service/app/providers/models.py
+index 8be8a59..a15577d 100644
+--- a/apps/rag_service/app/providers/models.py
++++ b/apps/rag_service/app/providers/models.py
+@@ -1,3 +1,9 @@
++"""模型服务 Provider 的通用数据模型。
++
++定义了 embedding、rerank、chat completion 三类模型调用的
++请求参数和返回结果的标准化数据结构。
++"""
++
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+@@ -5,27 +11,62 @@ from dataclasses import dataclass
+ 
+ @dataclass(frozen=True)
+ class EmbeddingResult:
++    """Embedding 模型调用结果。
++
++    包含原始文本向量化后的所有信息。
++    """
++
+     model: str
++    """实际使用的模型名称。"""
++
+     dimension: int
++    """向量的维度，应与配置中的 embedding_dimension 一致。"""
++
+     embeddings: list[list[float]]
++    """向量列表，顺序与输入文本一一对应。每个向量是浮点数列表，长度为 dimension。"""
++
+     usage: dict | None = None
++    """API 用量信息（token 数等），由模型服务返回，可能为 None。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class RerankDocument:
++    """Rerank 的输入文档。"""
++
+     id: str
++    """文档唯一标识，通常用 chunkId。结果中通过此 id 关联回原始文档。"""
++
+     text: str
++    """文档文本内容。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class RerankResult:
++    """Rerank 的单条结果。"""
++
+     id: str
++    """对应 RerankDocument 的 id。"""
++
+     index: int
++    """在原始输入文档列表中的位置（从 0 开始）。"""
++
+     score: float
++    """相关性分数，通常在 0~1 之间，分数越高越相关。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class ChatCompletionResult:
++    """Chat Completion 模型调用结果。
++
++    用于 query rewrite 和缺口聚类摘要生成。
++    目前仅支持 JSON 模式输出。
++    """
++
+     model: str
++    """实际使用的模型名称。"""
++
+     content: str
++    """模型输出的文本内容（JSON 字符串）。"""
++
+     usage: dict | None = None
++    """API 用量信息，由模型服务返回，可能为 None。"""
+diff --git a/apps/rag_service/app/retrievers/qdrant_store.py b/apps/rag_service/app/retrievers/qdrant_store.py
+index f17f0d6..9fdd50f 100644
+--- a/apps/rag_service/app/retrievers/qdrant_store.py
++++ b/apps/rag_service/app/retrievers/qdrant_store.py
+@@ -1,3 +1,14 @@
++"""Qdrant 向量库存储层。
++
++封装 Qdrant 的检索、写入和管理操作。
++Qdrant 在本项目中仅作为检索索引，不作为知识主库（主库是 Markdown + Git）。
++
++关键设计：
++- 检索始终通过 collection alias 访问，不直连实际 collection。
++- 每次 ingest 创建新 collection，ingest 完成后原子切换 alias，实现零停机更新。
++- point ID 基于 chunkId 的 UUID5 生成，同一条知识重复 ingest 时 ID 不变。
++"""
++
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+@@ -13,15 +24,32 @@ from apps.rag_service.app.ingestion.models import KnowledgeItem
+ 
+ @dataclass(frozen=True)
+ class QdrantStoreSettings:
++    """Qdrant 连接和配置参数。"""
++
+     url: str = "http://127.0.0.1:6333"
++    """Qdrant 服务地址。"""
++
+     api_key: str | None = None
++    """Qdrant API Key（可选）。"""
++
+     collection_alias: str = "dalizai_knowledge_v1"
++    """检索时使用的 collection 别名。始终通过别名访问。"""
++
+     collection_prefix: str = "dalizai_knowledge"
++    """实际 collection 名称前缀。每次 ingest 创建 {prefix}_{timestamp} 的新 collection。"""
++
+     vector_size: int = 1024
++    """向量维度，需与 embedding 模型输出一致。"""
++
+     distance: qmodels.Distance = qmodels.Distance.COSINE
++    """向量相似度度量方式，默认余弦相似度。"""
+ 
+ 
+ class QdrantKnowledgeStore:
++    """Qdrant 知识存储。
++
++    提供向量检索、批量写入、collection 管理和 alias 切换功能。
++    """
+     def __init__(
+         self,
+         settings: QdrantStoreSettings,
+@@ -39,6 +67,18 @@ class QdrantKnowledgeStore:
+         limit: int,
+         channel: str | None = None,
+     ) -> list[Any]:
++        """向量检索：在指定 collection 中查询最相似的 top-N 条记录。
++
++        Args:
++            collection_name: collection 名称（通常是 alias）。
++            query_vector: 查询的 embedding 向量。
++            filters: 业务域、知识类型、生效状态等过滤条件。
++            limit: 返回的最大结果数。
++            channel: 请求来源渠道，用于 scope 过滤。
++
++        Returns:
++            匹配的 Qdrant points 列表。
++        """
+         result = self.client.query_points(
+             collection_name=collection_name,
+             query=query_vector,
+@@ -50,6 +90,14 @@ class QdrantKnowledgeStore:
+         return list(result.points)
+ 
+     def _build_filter(self, filters: RagFilters, channel: str | None = None) -> qmodels.Filter:
++        """根据请求 filters 构建 Qdrant 查询过滤条件。
++
++        过滤维度：
++        1. businessDomains: 精确匹配（MatchAny）
++        2. knowledgeTypes: 精确匹配（MatchAny）
++        3. effectiveOnly: 仅返回 status=active 的记录
++        4. scope 过滤: channels/cityCodes/stationIds — 允许全局（空数组）或定向匹配
++        """
+         must: list[qmodels.Condition] = []
+         if filters.businessDomains:
+             must.append(
+@@ -76,6 +124,17 @@ class QdrantKnowledgeStore:
+         return qmodels.Filter(must=must)
+ 
+     def _scope_condition(self, key: str, value: str | None) -> qmodels.Filter:
++        """scope 匹配条件。
++
++        策略：
++        - 请求未传定向值（None）：只匹配全局知识（payload 中对应数组为空）。
++        - 请求传了定向值：匹配全局知识 OR 包含该定向值的知识。
++
++        例如，请求 cityCode=310000 时，能匹配：
++        - cityCodes=[]（全局通用知识）
++        - cityCodes 包含 310000（该城市的定向知识）
++        但不匹配 cityCodes 包含 320000（其他城市的知识）。
++        """
+         if value:
+             return qmodels.Filter(
+                 should=[
+@@ -101,6 +160,17 @@ class QdrantKnowledgeStore:
+         vectors: list[list[float]],
+         knowledge_version: str,
+     ) -> None:
++        """批量写入知识条目到 Qdrant（全量重建模式）。
++
++        第一版采用全量重建：每次 ingest 创建全新 collection，
++        upsert 所有知识条目，然后通过 switch_alias 原子切换。
++
++        Args:
++            collection_name: 目标 collection 名称（build collection）。
++            items: 知识条目列表。
++            vectors: 对应的向量列表，顺序必须与 items 一致。
++            knowledge_version: 知识版本号，写入每条 point 的 payload。
++        """
+         if len(items) != len(vectors):
+             raise ValueError("items and vectors length mismatch")
+         points = [
+@@ -119,6 +189,14 @@ class QdrantKnowledgeStore:
+         return int(result.count)
+ 
+     def switch_alias(self, collection_name: str) -> None:
++        """原子切换 alias 到新 collection。
++
++        先删除旧 alias，再创建指向新 collection 的 alias。
++        在 Qdrant 中 alias 操作是事务性的，实现零停机更新。
++
++        Args:
++            collection_name: 新 build collection 的名称。
++        """
+         operations: list[qmodels.AliasOperations] = []
+         aliases = self.client.get_aliases()
+         for alias in aliases.aliases:
+@@ -139,8 +217,11 @@ class QdrantKnowledgeStore:
+         self.client.update_collection_aliases(change_aliases_operations=operations)
+ 
+     def _point_id(self, chunk_id: str) -> str:
+-        # Qdrant point IDs can be UUIDs or unsigned integers. Use a stable UUID derived
+-        # from chunk_id so re-ingesting the same item into a build collection is deterministic.
++        """基于 chunkId 生成确定性的 point ID。
++
++        使用 UUID5（基于 URL namespace），确保同一 chunkId 每次 ingest
++        生成相同 point ID。这保证了重新 ingest 时的幂等性。
++        """
+         import uuid
+ 
+         return str(uuid.uuid5(uuid.NAMESPACE_URL, chunk_id))
+diff --git a/apps/rag_service/app/schemas/admin.py b/apps/rag_service/app/schemas/admin.py
+index 40d665d..3e849bc 100644
+--- a/apps/rag_service/app/schemas/admin.py
++++ b/apps/rag_service/app/schemas/admin.py
+@@ -1,43 +1,118 @@
++"""知识缺口管理的 Admin API Schema。
++
++提供管理员查看和处理知识缺口集群的数据模型。
++"""
++
+ from __future__ import annotations
+ 
+ from typing import Literal
+ 
+ from pydantic import BaseModel, Field
+ 
++# ── 缺口处理状态 ────────────────────────────────────────────
++
+ GapHandledStatus = Literal["open", "planned", "resolved", "ignored"]
++"""缺口集群的处理状态：
++
++- ``open``: 未处理，需要关注。
++- ``planned``: 已计划补充相关知识，但尚未入库。
++- ``resolved``: 已补充知识并入库，问题已解决。
++- ``ignored``: 确认无需处理（如超出知识范围的问题）。
++"""
++
++# ── 缺口集群响应 ────────────────────────────────────────────
+ 
+ 
+ class KnowledgeGapClusterResponse(BaseModel):
++    """单个知识缺口集群。
++
++    由多个相似的未命中/低置信度查询事件聚类而成，
++    帮助运营团队发现知识盲区。
++    """
++
+     clusterId: str
++    """集群唯一 ID。"""
++
+     representativeQuery: str
++    """代表性查询文本，最能概括本集群的用户问题。"""
++
+     clusterTitle: str | None = None
++    """LLM 生成的集群标题（不超过 20 字）。"""
++
+     summary: str | None = None
++    """LLM 生成的集群摘要（不超过 80 字）。"""
++
+     businessDomainGuess: str | None = None
++    """推测的业务域，基于事件中的 filter 信息。"""
++
+     knowledgeTypeGuess: str | None = None
++    """推测的知识类型，基于事件中的 filter 信息。"""
++
+     ownerTeam: str | None = None
++    """应负责处理的团队，基于业务域推测。"""
++
+     eventCount: int
++    """本集群包含的缺口事件总数。"""
++
+     statusBreakdown: dict[str, int] = Field(default_factory=dict)
++    """事件状态分布，如 ``{"not_found": 15, "low_confidence": 3}``。"""
++
+     topCandidateKnowledgeIds: list[str] = Field(default_factory=list)
++    """事件中最常被返回（但置信度不足）的知识 ID 列表。"""
++
+     queryExamples: list[str] = Field(default_factory=list)
++    """脱敏后的查询示例（最多 5 条）。"""
++
+     handledStatus: GapHandledStatus
++    """当前处理状态。"""
++
+     firstSeenAt: str
++    """首次出现该类型缺口的时间（ISO 8601）。"""
++
+     lastSeenAt: str
++    """最近一次出现的时间（ISO 8601）。"""
++
+     createdAt: str | None = None
++    """集群创建时间。"""
++
+     updatedAt: str | None = None
++    """集群最后更新时间。"""
+ 
+ 
+ class KnowledgeGapListResponse(BaseModel):
++    """知识缺口集群列表响应。"""
++
+     clusters: list[KnowledgeGapClusterResponse]
++    """集群列表，按最近出现时间降序。"""
++
+     count: int
++    """当前返回的集群数量。"""
++
++
++# ── 缺口状态更新 ────────────────────────────────────────────
+ 
+ 
+ class UpdateKnowledgeGapStatusRequest(BaseModel):
++    """更新缺口集群处理状态的请求。"""
++
+     handledStatus: GapHandledStatus
++    """新的处理状态。"""
++
+     handledBy: str | None = Field(default=None, max_length=100)
++    """处理人标识。"""
++
+     note: str | None = Field(default=None, max_length=500)
++    """处理备注，如补充的知识 ID 或忽略原因。"""
+ 
+ 
+ class UpdateKnowledgeGapStatusResponse(BaseModel):
++    """更新缺口集群处理状态的响应。"""
++
+     actionId: str
++    """本次操作的唯一 ID，用于审计追溯。"""
++
+     clusterId: str
++    """被更新的集群 ID。"""
++
+     handledStatus: GapHandledStatus
++    """更新后的处理状态。"""
+diff --git a/apps/rag_service/app/schemas/debug.py b/apps/rag_service/app/schemas/debug.py
+index 6eddaa1..98843ec 100644
+--- a/apps/rag_service/app/schemas/debug.py
++++ b/apps/rag_service/app/schemas/debug.py
+@@ -1,3 +1,9 @@
++"""RAG 调试控制台的 Schema。
++
++提供调试查询、评测用例浏览的数据模型。
++调试查询在一次请求中同时返回 RAG 原始结果和自动评测打分。
++"""
++
+ from __future__ import annotations
+ 
+ from typing import Any, Literal
+@@ -6,69 +12,195 @@ from pydantic import BaseModel, Field
+ 
+ from apps.rag_service.app.schemas.rag import RagFilters, RagQueryResponse
+ 
++# ── 评测用例来源 ────────────────────────────────────────────
++
+ EvalCaseSource = Literal["knowledge", "agent"]
++"""评测用例的数据来源：
++
++- ``knowledge``: 从知识 Markdown 文件的 Eval Questions 字段加载。
++- ``agent``: 从 ``eval/agent_cases.jsonl`` 文件加载。
++"""
++
++# ── 评测用例模型 ────────────────────────────────────────────
+ 
+ 
+ class EvalCaseResponse(BaseModel):
++    """评测用例的只读响应。"""
++
+     id: str
++    """用例唯一 ID，来自 ``knowledgeId__eval_NN`` 或 JSONL 中的 id。"""
++
+     query: str
++    """测试查询文本。"""
++
+     expectedStatus: str
++    """期望的 RAG 返回状态，如 ``success``、``not_found``。"""
++
+     shouldCallRag: bool = True
++    """Agent 是否应该为此类问题调用 RAG。False 表示不应调用。"""
++
+     businessDomains: list[str] = Field(default_factory=list)
++    """查询时应用的业务域过滤。"""
++
+     knowledgeTypes: list[str] = Field(default_factory=list)
++    """查询时应用的知识类型过滤。"""
++
+     expectedKnowledgeId: str | None = None
++    """期望命中的知识 ID（宽松匹配：命中任意一条即可）。"""
++
+     expectedContextIds: list[str] = Field(default_factory=list)
++    """期望命中的 chunk ID 列表（精确匹配）。"""
++
+     expectedClaims: list[str] = Field(default_factory=list)
++    """期望返回结果中包含的关键声明（用于评估忠实度）。"""
++
+     negativeContextIds: list[str] = Field(default_factory=list)
++    """不应出现在检索结果中的 chunk ID（用于评估精确率）。"""
++
+     channel: str = "wechat_mini_program"
++    """模拟的渠道。"""
++
+     intent: str | None = None
++    """模拟的意图。"""
++
+     subIntent: str | None = None
++    """模拟的子意图。"""
++
+     notes: str | None = None
++    """用例备注。"""
+ 
+ 
+ class EvalCaseListResponse(BaseModel):
++    """评测用例列表响应。"""
++
+     source: EvalCaseSource
++    """用例来源。"""
++
+     cases: list[EvalCaseResponse]
++    """用例列表。"""
++
+     count: int
++    """用例总数。"""
++
++
++# ── 调试查询模型 ────────────────────────────────────────────
+ 
+ 
+ class DebugQueryRequest(BaseModel):
++    """调试查询请求。
++
++    扩展了标准 RAG 查询请求，增加了评测期望值字段。
++    如果填写了期望值，调试终端会同时返回自动评测结果。
++    """
++
++    # RAG 查询基础字段
+     requestId: str | None = None
++    """可选请求 ID，不填则自动生成。"""
++
+     traceId: str | None = None
++    """可选链路 ID，不填则自动生成。"""
++
+     sessionId: str = "debug_session"
++    """调试会话 ID，默认为固定值。"""
++
+     userId: str | None = None
++    """模拟用户 ID。"""
++
+     channel: str = "wechat_mini_program"
++    """模拟渠道。"""
++
+     originalQuery: str | None = None
++    """用户原始表达。"""
++
+     query: str
++    """查询文本（必填）。"""
++
+     normalizedQueryHint: str | None = None
++    """归一化查询提示。"""
++
+     intent: str | None = None
++    """模拟意图。"""
++
+     subIntent: str | None = None
++    """模拟子意图。"""
++
+     topK: int | None = Field(default=5, ge=1)
++    """返回条数。"""
++
+     filters: RagFilters = Field(default_factory=RagFilters)
++    """检索过滤条件。"""
++
+     context: dict[str, Any] = Field(default_factory=dict)
++    """页面上下文。"""
++
++    # 评测期望值（可选，填写则触发自动评测）
+     expectedStatus: str | None = None
++    """期望的 RAG 状态。"""
++
+     expectedKnowledgeId: str | None = None
++    """期望命中的知识 ID。"""
++
+     expectedContextIds: list[str] = Field(default_factory=list)
++    """期望命中的 chunk ID 列表。"""
++
+     expectedClaims: list[str] = Field(default_factory=list)
++    """期望的关键声明。"""
++
+     negativeContextIds: list[str] = Field(default_factory=list)
++    """不应出现的 chunk ID。"""
++
+     referenceAnswer: str | None = None
++    """参考答案，用于评测响应相关性。"""
+ 
+ 
+ class DebugQueryEvaluation(BaseModel):
++    """单次调试查询的自动评测结果。"""
++
+     statusMatch: bool
++    """RAG 返回状态是否与期望一致。"""
++
+     expectedContextHit: bool
++    """是否至少命中一个期望的 chunk。"""
++
+     contextPrecision: float
++    """上下文精确率（命中的期望 chunk / 检索到的 chunk，考虑排名）。"""
++
+     contextRecall: float
++    """上下文召回率（命中的期望 chunk / 全部期望 chunk）。"""
++
+     faithfulnessProxy: float
++    """忠实度代理指标：期望声明被检索内容覆盖的比例。"""
++
+     responseRelevancyProxy: float
++    """相关性代理指标：检索内容与参考答案的术语重合度。"""
++
+     score: float
++    """综合评分：0.20*status + 0.25*precision + 0.25*recall + 0.15*faithfulness + 0.15*relevancy。"""
++
+     passed: bool
++    """是否通过评测：statusMatch=True 且 expectedContextHit=True 且 score >= 0.75。"""
++
+     retrievedContextIds: list[str]
++    """实际检索到的 chunk ID 列表。"""
++
+     retrievedKnowledgeIds: list[str]
++    """实际检索到的知识 ID 列表。"""
+ 
+ 
+ class DebugQueryResponse(BaseModel):
++    """调试查询响应。
++
++    包含原始 RAG 响应和可选的自动评测结果。
++    """
++
+     requestId: str
++    """请求 ID。"""
++
+     traceId: str
++    """链路 ID。"""
++
+     response: RagQueryResponse
++    """RAG 服务返回的原始查询响应。"""
++
+     evaluation: DebugQueryEvaluation | None = None
++    """自动评测结果，仅当请求中填写了期望值时返回。"""
+diff --git a/apps/rag_service/app/schemas/rag.py b/apps/rag_service/app/schemas/rag.py
+index 1b87f98..873306a 100644
+--- a/apps/rag_service/app/schemas/rag.py
++++ b/apps/rag_service/app/schemas/rag.py
+@@ -1,78 +1,218 @@
++"""RAG 查询接口的请求/响应 Schema。
++
++定义了 Agent 调用 POST /v1/rag/query 的完整数据模型。
++所有字段使用 camelCase 命名以保持 API JSON 风格一致。
++"""
++
+ from __future__ import annotations
+ 
+ from typing import Any, Literal
+ 
+ from pydantic import BaseModel, Field
+ 
++# ── 状态枚举 ────────────────────────────────────────────────
++
+ RagStatus = Literal["success", "low_confidence", "not_found", "error"]
++"""RAG 检索状态：
++
++- ``success``: confidence >= 0.75，Agent 可放心使用 allowedClaims 回复。
++- ``low_confidence``: 0.50 <= confidence < 0.75，Agent 应谨慎回答或转人工。
++- ``not_found``: confidence < 0.50 或无候选，Agent 应澄清或转人工。
++- ``error``: RAG 或依赖异常，Agent 应安全兜底。
++"""
++
++# ── 请求模型 ────────────────────────────────────────────────
+ 
+ 
+ class RagFilters(BaseModel):
++    """检索过滤条件。
++
++    由 Agent 根据意图识别结果传入，用于缩小检索范围。
++    所有字段均可选，未传表示不过滤。
++    """
++
+     businessDomains: list[str] | None = None
++    """业务域过滤，如 ``["charging", "payment"]``。未传表示全部域。"""
++
+     knowledgeTypes: list[str] | None = None
++    """知识类型过滤，如 ``["faq", "refund_policy"]``。未传表示全部类型。"""
++
+     effectiveOnly: bool = True
++    """是否仅查询当前生效（active 且在有效期内）的知识。默认 True。"""
++
+     cityCode: str | None = None
++    """城市过滤（第一版弱实现，保留字段）。"""
++
+     stationId: str | None = None
++    """站点过滤（第一版弱实现，保留字段）。"""
+ 
+ 
+ class RagQueryRequest(BaseModel):
++    """RAG 查询请求。
++
++    Agent / MCP 调用 POST /v1/rag/query 时的请求体。
++    """
++
+     requestId: str
++    """Agent 当前请求的唯一 ID，用于全链路追踪。"""
++
+     traceId: str
++    """分布式链路追踪 ID，贯穿 Agent → RAG → 模型服务。"""
++
+     sessionId: str
++    """会话 ID，RAG 侧会 hash 后存储，不存明文。"""
++
+     userId: str | None = None
++    """用户 ID，RAG 侧会 hash 后存储，不存明文。"""
++
+     channel: str = "wechat_mini_program"
++    """来源渠道，第一版固定为微信小程序。用于知识 scope 匹配。"""
++
+     originalQuery: str | None = None
++    """用户原始输入文本，未传时等同 query。"""
++
+     query: str
++    """Agent 传给 RAG 的查询文本，可能是用户原话或经过轻量处理。"""
++
+     normalizedQueryHint: str | None = None
++    """Agent 对明确意图给出的归一化提示，仅作为 RAG query rewrite 的辅助信号。"""
++
+     intent: str | None = None
++    """Agent 识别出的主意图，如 "faq"、"refund"。"""
++
+     subIntent: str | None = None
++    """Agent 识别出的子意图，如 "charge_scan_guide"。"""
++
+     topK: int | None = Field(default=None, ge=1)
++    """期望返回的知识条目数，默认 5，最大 10。"""
++
+     filters: RagFilters = Field(default_factory=RagFilters)
++    """检索过滤条件。"""
++
+     context: dict[str, Any] = Field(default_factory=dict)
++    """脱敏后的页面上下文，如 pageContext 等低风险信息。"""
++
++
++# ── 响应模型 ────────────────────────────────────────────────
+ 
+ 
+ class KnowledgeSource(BaseModel):
++    """知识条目的来源追溯信息。"""
++
+     docId: str | None = None
++    """来源文档 ID，对应 Markdown 文件 front matter 中的 docId。"""
++
+     docTitle: str | None = None
++    """来源文档标题。"""
++
+     section: str | None = None
++    """文档内的章节/条目标题。"""
++
+     updatedAt: str | None = None
++    """知识最后更新时间。"""
+ 
+ 
+ class KnowledgeItemResponse(BaseModel):
++    """单条检索到的知识条目。
++
++    包含知识全文、可用的声明、禁止的声明以及检索置信度。
++    """
++
+     knowledgeId: str
++    """知识条目唯一 ID，如 ``faq_charge_scan_001``。"""
++
+     chunkId: str
++    """chunk 唯一 ID，如 ``faq_charge_scan_001#main``。"""
++
+     title: str
++    """知识条目标题。"""
++
+     businessDomain: str | None = None
++    """业务域，如 ``charging``、``refund``。"""
++
+     knowledgeType: str | None = None
++    """知识类型，如 ``faq``、``refund_policy``。"""
++
+     summary: str
++    """知识摘要，可用于快速判断相关性。"""
++
+     content: str
++    """知识正文，是 Agent 组织回复的参考依据。"""
++
+     score: float
++    """本条知识的最终置信度分数（rerank score 与文本信号加权后的结果）。"""
++
+     allowedClaims: list[str]
++    """允许表达列表：Agent 可以在回复中使用的、经过业务审核的陈述句。"""
++
+     forbiddenClaims: list[str] = Field(default_factory=list)
++    """禁止表达列表：Agent 不得使用的陈述句，通常是高风险或未经验证的说法。"""
++
+     source: KnowledgeSource
++    """来源追溯信息。"""
++
+     cards: list[dict[str, Any]] = Field(default_factory=list)
++    """卡片展示信息（第一版保留字段，暂不使用）。"""
+ 
+ 
+ class RagFallback(BaseModel):
++    """RAG 无法正常返回时的兜底建议。"""
++
+     reason: str
++    """兜底原因，如 ``no_relevant_knowledge``、``rag_unavailable``。"""
++
+     suggestedAction: str
++    """建议 Agent 执行的动作，如 ``clarify_or_handoff``、``safe_fallback``。"""
+ 
+ 
+ class RagError(BaseModel):
++    """RAG 错误详情。"""
++
+     code: str
++    """错误码，如 ``rag_embedding_failed``、``rag_qdrant_query_failed``。"""
++
+     message: str
++    """人类可读的错误描述。"""
++
+     retryable: bool
++    """是否建议 Agent 重试。True 表示可能是临时故障，False 表示需要修复后才可重试。"""
+ 
+ 
+ class RagQueryResponse(BaseModel):
++    """RAG 查询响应。
++
++    这是 POST /v1/rag/query 的完整响应体，Agent 根据 status 字段分流处理。
++    """
++
+     requestId: str
++    """原请求 ID，用于关联请求和响应。"""
++
+     traceId: str
++    """原链路追踪 ID。"""
++
+     status: RagStatus
++    """检索状态：success / low_confidence / not_found / error。"""
++
+     answerable: bool
++    """Agent 是否可以基于返回结果回答用户问题。仅 success 状态为 True。"""
++
+     confidence: float
++    """整体检索置信度，取排名第一的知识条目的最终分数。"""
++
+     queryRewrite: str | None = None
++    """RAG 改写后的检索句，只用于观测和审计，Agent 不应把它当成业务结论。"""
++
+     knowledgeVersion: str | None = None
++    """知识库版本号，用于问题回溯时的版本定位。"""
++
+     items: list[KnowledgeItemResponse] = Field(default_factory=list)
++    """检索到的知识条目列表，按置信度降序排列。"""
++
+     fallback: RagFallback | None = None
++    """当 status 非 success 时的兜底建议。"""
++
+     error: RagError | None = None
++    """当 status=error 时的错误详情。"""
++
+     latencyMs: int | None = None
++    """RAG 服务端处理耗时（毫秒），不含网络传输时间。"""
+diff --git a/apps/rag_service/app/services/query_rewriter.py b/apps/rag_service/app/services/query_rewriter.py
+index 931b8c1..c1d704d 100644
+--- a/apps/rag_service/app/services/query_rewriter.py
++++ b/apps/rag_service/app/services/query_rewriter.py
+@@ -1,3 +1,12 @@
++"""Query Rewrite 模块。
++
++在 RAG 检索前，将 Agent 传入的用户查询（可能是口语化、不完整的表达）
++改写为更适合知识库向量检索的中文检索短句。
++
++使用 DashScope Chat 模型（qwen-turbo），采用 JSON 模式输出。
++改写失败时自动 fallback 到原始 query，不阻塞检索链路。
++"""
++
+ from __future__ import annotations
+ 
+ import json
+@@ -8,18 +17,47 @@ from apps.rag_service.app.schemas.rag import RagQueryRequest
+ 
+ 
+ class QueryRewriteChatClient(Protocol):
++    """Query Rewrite 所需的 Chat Client 接口（Protocol，不依赖具体实现）。
++
++    这样做是为了解耦：QueryRewriter 不依赖 DashScopeChatClient 的具体类型，
++    只要任何有 ``complete_json`` 方法的对象都可以注入（便于测试 mock）。
++    """
+     def complete_json(self, system_prompt: str, user_prompt: str) -> Any:
+         ...
+ 
+ 
+ class QueryRewriter:
+-    """Qwen-backed query rewrite for the RAG retrieval chain."""
++    """Query Rewrite 改写器。
++
++    调用 Qwen Chat 模型将用户口语查询改写为 2-4 个检索短句。
++    改写失败时自动退回到原始 query（保证服务可用性高于改写质量）。
++    """
+ 
+     def __init__(self, chat_client: QueryRewriteChatClient, *, fallback_on_error: bool = True) -> None:
++        """初始化改写器。
++
++        Args:
++            chat_client: Chat Completion 客户端（注入 DashScopeChatClient 或 mock）。
++            fallback_on_error: True 时改写失败返回原始 query；False 时抛出异常。
++        """
+         self.chat_client = chat_client
+         self.fallback_on_error = fallback_on_error
+ 
+     def rewrite(self, request: RagQueryRequest) -> str:
++        """对查询请求执行改写。
++
++        流程：
++        1. 构建 system prompt（定义改写任务）和 user prompt（包含查询上下文）。
++        2. 调用 Chat API 获取 JSON 输出。
++        3. 解析 JSON，提取 queryRewrite 字段。
++        4. 异常时 fallback 到 request.query。
++
++        Args:
++            request: RAG 查询请求。
++
++        Returns:
++            改写后的检索句（2-4 个短句用中文分号连接），或原始 query。
++        """
+         try:
+             result = self.chat_client.complete_json(
+                 self._system_prompt(),
+@@ -27,12 +65,23 @@ class QueryRewriter:
+             )
+             rewrite = self._parse_rewrite(result.content)
+         except (ModelProviderError, json.JSONDecodeError, TypeError, ValueError):
++            # Chat API 异常或 JSON 解析失败时：fallback 到原始 query
+             if not self.fallback_on_error:
+                 raise
+             return request.query
+         return rewrite or request.query
+ 
+     def _system_prompt(self) -> str:
++        """生成 system prompt：定义改写任务的角色、格式和约束。
++
++        关键约束：
++        - 只输出 JSON，不输出解释。
++        - 短句风格像知识库标题（FAQ/规则/指引），不像是客服回复。
++        - normalizedQueryHint（如存在且不冲突）必须作为第一个短句。
++        - 结合 pageContext 补充业务检索词（如"订单结算页未展示卡券"）。
++        - 不编造具体订单/金额/退款/设备状态。
++        - 保留关键实体、业务域和问题类型。
++        """
+         return (
+             "你是独立知识 RAG 服务的 query rewrite 模块。"
+             "你的任务是把用户问题改写为更适合知识库检索的中文检索句。"
+@@ -47,6 +96,11 @@ class QueryRewriter:
+         )
+ 
+     def _user_prompt(self, request: RagQueryRequest) -> str:
++        """将 RAG 查询请求序列化为 user prompt 的 JSON 字符串。
++
++        包含原始查询、归一化提示、意图、渠道、过滤条件和页面上下文，
++        给模型足够信息来生成精准的检索句。
++        """
+         payload = {
+             "originalQuery": request.originalQuery or request.query,
+             "query": request.query,
+@@ -60,12 +114,25 @@ class QueryRewriter:
+         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+ 
+     def _parse_rewrite(self, content: str) -> str:
++        """从 Chat API 返回的 JSON 中解析 queryRewrite。
++
++        容错处理：
++        - 如果 queryRewrite 是数组，用中文分号连接。
++        - 统一中文分号（替换英文分号）。
++        - 截断到 300 字符（防止模型输出过长）。
++        - 去掉空短句。
++
++        Raises:
++            ValueError: queryRewrite 为空或格式不正确。
++        """
+         data = json.loads(content)
+         value = data.get("queryRewrite") if isinstance(data, dict) else None
++        # 容错：如果模型输出的是数组，转成字符串
+         if isinstance(value, list):
+             value = "；".join(str(item).strip() for item in value if str(item).strip())
+         if not isinstance(value, str):
+             raise ValueError("queryRewrite must be a string or string list")
++        # 统一分号为中文分号，去掉空字符串
+         rewrite = "；".join(part.strip() for part in value.replace(";", "；").split("；") if part.strip())
+         if not rewrite:
+             raise ValueError("queryRewrite cannot be empty")
+diff --git a/apps/rag_service/app/services/rag_query_service.py b/apps/rag_service/app/services/rag_query_service.py
+index 6c481f8..f240596 100644
+--- a/apps/rag_service/app/services/rag_query_service.py
++++ b/apps/rag_service/app/services/rag_query_service.py
+@@ -1,3 +1,21 @@
++"""RAG 查询服务 —— 系统的核心编排层。
++
++这是整个 RAG 检索链路的总入口，负责编排以下步骤：
++
++1. **Query Rewrite**: 调用 Chat 模型将口语查询改写为检索短句。
++2. **Embedding**: 将改写后的查询向量化。
++3. **向量检索**: 在 Qdrant 中通过余弦相似度召回候选。
++4. **Rerank**: 调用 Rerank 模型对候选重新排序。
++5. **信号增强**: 加权关键词/相似问法的文本匹配分数（与 rerank score 取 max）。
++6. **阈值分档**: 按 confidence 分为 success / low_confidence / not_found。
++7. **审计记录**: 每次查询写入审计日志和（如适用）知识缺口事件。
++
++关键设计决策：
++- Rerank score 和文本信号 score 取最大值而非加权平均，因为精确关键词匹配
++  可能被向量语义检索遗漏，两种信号互补。
++- 审计日志和缺口记录写入失败不阻塞查询响应（静默降级）。
++"""
++
+ from __future__ import annotations
+ 
+ import time
+@@ -32,8 +50,21 @@ from apps.rag_service.app.storage.repository import (
+ 
+ 
+ class RagQueryService:
++    """RAG 查询服务。
++
++    对每次 POST /v1/rag/query 请求执行完整的检索链路，
++    返回结构化的知识条目和置信度供 Agent 决策。
++    """
++
+     def __init__(self, settings: Settings) -> None:
++        """初始化查询服务。创建模型客户端、Qdrant 存储、元数据仓储、
++        Query Rewriter 等所有依赖。每次请求构造新实例，不做单例复用。
++
++        Args:
++            settings: 全局配置。
++        """
+         self.settings = settings
++        # 构建 DashScope 连接配置（三个 client 共享同一组认证信息）
+         model_settings = DashScopeSettings(
+             api_key=settings.dashscope_api_key,
+             embedding_base_url=settings.dashscope_embedding_base_url,
+@@ -61,11 +92,32 @@ class RagQueryService:
+         self.query_rewriter = QueryRewriter(self.query_rewrite_client)
+ 
+     def query(self, request: RagQueryRequest) -> RagQueryResponse:
++        """执行完整的 RAG 检索链路。
++
++        流程：
++        1. 确定 top_k 和 recall_limit（max(topK, rerank_top_n)）。
++        2. Query Rewrite：口语 → 检索短句。
++        3. Embedding + Qdrant 向量检索。
++        4. 无候选 → not_found。
++        5. Rerank 重排序。
++        6. 文本信号增强：max(rerank_score, text_signal_score)。
++        7. 阈值分档并返回。
++
++        Args:
++            request: RAG 查询请求。
++
++        Returns:
++            RagQueryResponse: 结构化检索结果，含知识条目、置信度和兜底建议。
++        """
+         started = time.perf_counter()
++        # ── 确定 top_k 和 recall_limit ──────────────────
+         top_k = min(request.topK or self.settings.rag_default_top_k, self.settings.rag_max_top_k)
+         recall_limit = max(top_k, self.settings.rerank_top_n)
++
++        # ── Query Rewrite ───────────────────────────────
+         query_rewrite = self.query_rewriter.rewrite(request)
+ 
++        # ── Embedding + Qdrant 向量检索 ─────────────────
+         try:
+             embedding = self.embedding_client.embed_texts([query_rewrite]).embeddings[0]
+             points = self.store.search(
+@@ -79,6 +131,8 @@ class RagQueryService:
+             return self._error_response(request, started, "rag_embedding_failed", str(exc), exc.retryable)
+         except Exception as exc:
+             return self._error_response(request, started, "rag_qdrant_query_failed", str(exc), True)
++
++        # ── 无候选 → not_found ─────────────────────────
+         if not points:
+             return self._response(
+                 request,
+@@ -91,6 +145,8 @@ class RagQueryService:
+                 started=started,
+             )
+ 
++        # ── Rerank 重排序 ──────────────────────────────
++        # 构建 rerank 输入：用 chunkId 作为 id，把知识各字段拼接为 text
+         rerank_docs = [
+             RerankDocument(id=str(point.payload.get("chunkId")), text=self._rerank_text(point.payload))
+             for point in points
+@@ -99,7 +155,12 @@ class RagQueryService:
+             rerank_results = self.rerank_client.rerank(query_rewrite, rerank_docs, top_n=top_k)
+         except ModelProviderError as exc:
+             return self._error_response(request, started, "rag_rerank_failed", str(exc), exc.retryable)
++
++        # chunkId → point 映射，用于将 rerank 结果关联回原始 payload
+         point_by_chunk_id = {str(point.payload.get("chunkId")): point for point in points}
++
++        # ── 信号增强：max(rerank_score, text_signal_score) ──
++        # 取最大值：精确关键词/相似问法匹配（文本信号）可能被向量检索遗漏
+         ranked_points: list[tuple[Any, float]] = []
+         for result in rerank_results:
+             point = point_by_chunk_id.get(result.id)
+@@ -108,6 +169,7 @@ class RagQueryService:
+                 ranked_points.append((point, score))
+         ranked_points.sort(key=lambda item: item[1], reverse=True)
+ 
++        # 极端情况：rerank 结果全部无法关联到原始 point
+         if not ranked_points:
+             return self._response(
+                 request,
+@@ -120,6 +182,8 @@ class RagQueryService:
+                 started=started,
+             )
+ 
++        # ── 阈值分档 ───────────────────────────────────
++        # confidence 取排名第一的分数（整个检索应答的置信度）
+         confidence = ranked_points[0][1]
+         selected = ranked_points[:top_k]
+         items = [self._item_response(point, score) for point, score in selected]
+@@ -171,6 +235,7 @@ class RagQueryService:
+         message: str,
+         retryable: bool,
+     ) -> RagQueryResponse:
++        """构建错误响应。写入审计日志后返回 status=error 的响应。"""
+         response = RagQueryResponse(
+             requestId=request.requestId,
+             traceId=request.traceId,
+@@ -188,6 +253,11 @@ class RagQueryService:
+         return response
+ 
+     def _response(self, request: RagQueryRequest, started: float, **kwargs: Any) -> RagQueryResponse:
++        """构建正常响应（success / low_confidence / not_found）。
++
++        通过 **kwargs 传入动态字段，自动计算 latency_ms。
++        每条响应都会写入审计日志。
++        """
+         response = RagQueryResponse(
+             requestId=request.requestId,
+             traceId=request.traceId,
+@@ -198,11 +268,20 @@ class RagQueryService:
+         return response
+ 
+     def _record_query(self, request: RagQueryRequest, response: RagQueryResponse) -> None:
++        """写入审计日志和（如适用）知识缺口事件。
++
++        关键设计：
++        - sessionId 和 userId 经 SHA-256 hash 后存储，不存明文。
++        - query 和 originalQuery 经 PII 脱敏后存储。
++        - not_found 和 low_confidence 的查询额外写入 gap_events 表。
++        - 整个 try/except 包裹，写入失败静默返回，绝不影响 RAG 主链路。
++        """
+         try:
+             salt = self.settings.rag_service_api_key
+             top_knowledge_ids = [item.knowledgeId for item in response.items]
+             top_chunk_ids = [item.chunkId for item in response.items]
+             top_doc_ids = [item.source.docId for item in response.items if item.source.docId]
++            # ── 写入审计日志 ──────────────────────────
+             self.repository.create_audit_log(
+                 AuditLogRecord(
+                     audit_id=new_id("audit"),
+@@ -227,6 +306,7 @@ class RagQueryService:
+                     error_code=response.error.code if response.error else None,
+                 )
+             )
++            # ── 写入知识缺口事件（仅 not_found / low_confidence）──
+             if response.status in {"not_found", "low_confidence"}:
+                 self.repository.create_gap_event(
+                     KnowledgeGapEventRecord(
+@@ -253,6 +333,11 @@ class RagQueryService:
+             return
+ 
+     def _rerank_text(self, payload: dict[str, Any]) -> str:
++        """构建 rerank 模型的输入文本。
++
++        拼接标题、摘要、关键词、相似问法、正文、允许表达。
++        使用换行分隔各字段，末尾过滤掉仅含分隔符的空字段。
++        """
+         parts = [
+             f"标题：{payload.get('title') or ''}",
+             f"摘要：{payload.get('summary') or ''}",
+@@ -264,6 +349,25 @@ class RagQueryService:
+         return "\n".join(part for part in parts if part.strip("："))
+ 
+     def _query_signal_score(self, query: str, payload: dict[str, Any]) -> float:
++        """计算查询与知识条目之间的文本信号分数。
++
++        不依赖向量，而是基于字符级的精确匹配、子串匹配和 bigram 相似度。
++        用于补充向量检索可能遗漏的精确关键词/相似问法匹配。
++
++        打分策略（按优先级，命中即返回）：
++        - 精确匹配（归一化后完全相等）: 0.92
++        - 双向子串匹配（≥4 字符）: 0.88
++        - 双字符 bigram Jaccard ≥ 0.55: 0.90
++        - 双字符 bigram Jaccard ≥ 0.30: 0.78
++        - 无匹配: 0.0
++
++        Args:
++            query: 改写后的查询文本。
++            payload: Qdrant 存储的知识条目 payload。
++
++        Returns:
++            文本信号分数（0.0 ~ 0.92）。
++        """
+         candidates = [
+             str(payload.get("title") or ""),
+             *[str(value) for value in payload.get("keywords") or []],
+@@ -277,10 +381,13 @@ class RagQueryService:
+             normalized_candidate = self._normalize_signal_text(candidate)
+             if not normalized_candidate:
+                 continue
++            # 精确匹配（忽略大小写和标点）
+             if normalized_query == normalized_candidate:
+                 return 0.92
++            # candidate 是 query 的子串
+             if len(normalized_candidate) >= 4 and normalized_candidate in normalized_query:
+                 return 0.88
++            # query 是 candidate 的子串
+             if len(normalized_query) >= 4 and normalized_query in normalized_candidate:
+                 return 0.88
+             best_similarity = max(
+@@ -294,9 +401,25 @@ class RagQueryService:
+         return 0.0
+ 
+     def _normalize_signal_text(self, value: str) -> str:
++        """归一化文本：去除非字母数字字符，统一小写。
++
++        用于在文本信号评分中做容错匹配。
++        """
+         return "".join(ch.lower() for ch in value if ch.isalnum())
+ 
+     def _char_bigram_similarity(self, left: str, right: str) -> float:
++        """计算两个归一化字符串的字符级 bigram Jaccard 相似度。
++
++        将字符串切分为相邻两个字符的集合，计算交集/并集比例。
++        纯字符级，不需要分词器。
++
++        Args:
++            left: 归一化后的字符串。
++            right: 归一化后的字符串。
++
++        Returns:
++            Jaccard 相似度（0.0 ~ 1.0）。至少一侧 < 2 字符时返回 0.0。
++        """
+         if left == right:
+             return 1.0
+         if len(left) < 2 or len(right) < 2:
+@@ -308,6 +431,10 @@ class RagQueryService:
+         return len(left_grams & right_grams) / len(left_grams | right_grams)
+ 
+     def _item_response(self, point: Any, score: float) -> KnowledgeItemResponse:
++        """从 Qdrant point 构建 KnowledgeItemResponse。
++
++        从 payload 中提取所有字段，source 从嵌套 JSON 中还原。
++        """
+         payload = point.payload
+         source = payload.get("source") or {}
+         return KnowledgeItemResponse(
+@@ -326,6 +453,11 @@ class RagQueryService:
+         )
+ 
+     def _knowledge_version(self, points: list[Any]) -> str | None:
++        """从检索结果中提取知识库版本号。
++
++        取第一条命中 point 的 knowledgeVersion 字段。
++        同一次检索的所有结果应属于同一版本（ingest 时统一设置）。
++        """
+         for point in points:
+             value = (point.payload or {}).get("knowledgeVersion")
+             if value:
+diff --git a/apps/rag_service/app/storage/database.py b/apps/rag_service/app/storage/database.py
+index ff6a8b7..48a1845 100644
+--- a/apps/rag_service/app/storage/database.py
++++ b/apps/rag_service/app/storage/database.py
+@@ -1,3 +1,9 @@
++"""SQLite 数据库连接管理。
++
++封装 SQLite 连接和初始化逻辑。第一版仅支持 ``sqlite:///`` 前缀的本地文件数据库，
++使用 WAL 日志模式提高并发读取性能。所有表通过 ``CREATE TABLE IF NOT EXISTS`` 保证幂等初始化。
++"""
++
+ from __future__ import annotations
+ 
+ import sqlite3
+@@ -5,10 +11,32 @@ from pathlib import Path
+ 
+ 
+ class SqliteDatabase:
++    """SQLite 数据库连接管理器。
++
++    负责：
++    - 解析 ``sqlite:///path`` 格式的数据库 URL
++    - 创建数据库文件所在目录（如不存在）
++    - 开启 WAL 日志模式和外键约束
++    - 初始化所有元数据表结构
++    """
++
+     def __init__(self, db_url: str = "sqlite:///data/rag_service.db") -> None:
++        """初始化连接管理器，解析数据库文件路径。
++
++        Args:
++            db_url: SQLite 数据库 URL，格式 ``sqlite:///relative/or/absolute/path``。
++        """
+         self.db_path = self._parse_sqlite_url(db_url)
+ 
+     def connect(self) -> sqlite3.Connection:
++        """创建并返回一个新的数据库连接。
++
++        每次调用都会创建新连接，使用 sqlite3.Row 作为行工厂以支持字典式访问。
++        自动创建数据库文件所在目录。
++
++        Returns:
++            已配置好 pragma 和行工厂的 sqlite3.Connection。
++        """
+         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+         connection = sqlite3.connect(self.db_path)
+         connection.row_factory = sqlite3.Row
+@@ -17,10 +45,22 @@ class SqliteDatabase:
+         return connection
+ 
+     def initialize(self) -> None:
++        """执行建表 SQL，初始化所有元数据表。幂等操作，重复执行安全。"""
+         with self.connect() as connection:
+             connection.executescript(SCHEMA_SQL)
+ 
+     def _parse_sqlite_url(self, db_url: str) -> Path:
++        """解析 ``sqlite:///`` 格式的 URL 为文件系统路径。
++
++        Args:
++            db_url: 数据库 URL。
++
++        Returns:
++            数据库文件的 Path 对象。
++
++        Raises:
++            ValueError: URL 格式不正确或路径为空。
++        """
+         prefix = "sqlite:///"
+         if not db_url.startswith(prefix):
+             raise ValueError("Only sqlite:/// URLs are supported in v1")
+@@ -30,7 +70,21 @@ class SqliteDatabase:
+         return Path(raw_path)
+ 
+ 
++# ═══════════════════════════════════════════════════════════════
++# 数据库 Schema
++# ═══════════════════════════════════════════════════════════════
++#
++# 5 张表的设计分工：
++#
++# 1. ingest_runs — 知识入库运行记录，记录每次 ingest 的版本、数量、状态。
++# 2. audit_logs — RAG 查询审计日志，所有 PII 已脱敏/hash。
++# 3. knowledge_gap_clusters — 知识缺口集群，由聚类服务自动生成。
++# 4. knowledge_gap_events — 知识缺口事件，每次 not_found / low_confidence 时记录。
++# 5. knowledge_gap_cluster_actions — 缺口集群处理操作审计记录。
++# ═══════════════════════════════════════════════════════════════
++
+ SCHEMA_SQL = """
++-- ── 入库运行记录 ────────────────────────────────────────────
+ CREATE TABLE IF NOT EXISTS ingest_runs (
+     ingest_id TEXT PRIMARY KEY,
+     knowledge_version TEXT NOT NULL,
+@@ -52,15 +106,16 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
+ CREATE INDEX IF NOT EXISTS idx_ingest_runs_started_at ON ingest_runs(started_at);
+ CREATE INDEX IF NOT EXISTS idx_ingest_runs_status ON ingest_runs(status);
+ 
++-- ── RAG 查询审计日志 ────────────────────────────────────────
+ CREATE TABLE IF NOT EXISTS audit_logs (
+     audit_id TEXT PRIMARY KEY,
+     request_id TEXT NOT NULL,
+     trace_id TEXT NOT NULL,
+-    session_id_hash TEXT,
+-    user_id_hash TEXT,
++    session_id_hash TEXT,          -- SHA-256 hash(salt + sessionId)，不存明文
++    user_id_hash TEXT,             -- SHA-256 hash(salt + userId)，不存明文
+     channel TEXT NOT NULL,
+-    original_query_masked TEXT,
+-    query_masked TEXT NOT NULL,
++    original_query_masked TEXT,    -- PII 脱敏后的原始查询
++    query_masked TEXT NOT NULL,    -- PII 脱敏后的查询文本
+     intent TEXT,
+     sub_intent TEXT,
+     filters_json TEXT NOT NULL DEFAULT '{}',
+@@ -80,19 +135,20 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_trace_id ON audit_logs(trace_id);
+ CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+ CREATE INDEX IF NOT EXISTS idx_audit_logs_status ON audit_logs(status);
+ 
++-- ── 知识缺口集群 ────────────────────────────────────────────
+ CREATE TABLE IF NOT EXISTS knowledge_gap_clusters (
+     cluster_id TEXT PRIMARY KEY,
+     representative_query TEXT NOT NULL,
+-    cluster_title TEXT,
+-    summary TEXT,
++    cluster_title TEXT,            -- LLM 生成的标题（≤20 字）
++    summary TEXT,                  -- LLM 生成的摘要（≤80 字）
+     business_domain_guess TEXT,
+     knowledge_type_guess TEXT,
+     owner_team TEXT,
+     event_count INTEGER NOT NULL DEFAULT 0,
+-    status_breakdown_json TEXT NOT NULL DEFAULT '{}',
++    status_breakdown_json TEXT NOT NULL DEFAULT '{}',         -- {"not_found": N, "low_confidence": N}
+     top_candidate_knowledge_ids_json TEXT NOT NULL DEFAULT '[]',
+     query_examples_json TEXT NOT NULL DEFAULT '[]',
+-    handled_status TEXT NOT NULL DEFAULT 'open',
++    handled_status TEXT NOT NULL DEFAULT 'open',              -- open / planned / resolved / ignored
+     first_seen_at TEXT NOT NULL,
+     last_seen_at TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+@@ -104,9 +160,10 @@ ON knowledge_gap_clusters(handled_status);
+ CREATE INDEX IF NOT EXISTS idx_gap_clusters_last_seen_at
+ ON knowledge_gap_clusters(last_seen_at);
+ 
++-- ── 知识缺口事件 ────────────────────────────────────────────
+ CREATE TABLE IF NOT EXISTS knowledge_gap_events (
+     gap_event_id TEXT PRIMARY KEY,
+-    cluster_id TEXT,
++    cluster_id TEXT,               -- 所属集群 ID，未聚类时为 NULL
+     request_id TEXT NOT NULL,
+     trace_id TEXT NOT NULL,
+     session_id_hash TEXT,
+@@ -117,7 +174,7 @@ CREATE TABLE IF NOT EXISTS knowledge_gap_events (
+     intent TEXT,
+     sub_intent TEXT,
+     filters_json TEXT NOT NULL DEFAULT '{}',
+-    status TEXT NOT NULL,
++    status TEXT NOT NULL,          -- not_found 或 low_confidence
+     confidence REAL NOT NULL DEFAULT 0,
+     business_domain_guess TEXT,
+     knowledge_type_guess TEXT,
+@@ -130,12 +187,13 @@ CREATE INDEX IF NOT EXISTS idx_gap_events_cluster_id ON knowledge_gap_events(clu
+ CREATE INDEX IF NOT EXISTS idx_gap_events_created_at ON knowledge_gap_events(created_at);
+ CREATE INDEX IF NOT EXISTS idx_gap_events_status ON knowledge_gap_events(status);
+ 
++-- ── 缺口集群处理操作记录 ────────────────────────────────────
+ CREATE TABLE IF NOT EXISTS knowledge_gap_cluster_actions (
+     action_id TEXT PRIMARY KEY,
+     cluster_id TEXT NOT NULL,
+-    handled_status TEXT NOT NULL,
+-    handled_by TEXT,
+-    note TEXT,
++    handled_status TEXT NOT NULL,  -- 操作后的状态
++    handled_by TEXT,               -- 处理人
++    note TEXT,                     -- 处理备注
+     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     FOREIGN KEY(cluster_id) REFERENCES knowledge_gap_clusters(cluster_id)
+ );
+diff --git a/apps/rag_service/app/storage/repository.py b/apps/rag_service/app/storage/repository.py
+index 675764c..603b822 100644
+--- a/apps/rag_service/app/storage/repository.py
++++ b/apps/rag_service/app/storage/repository.py
+@@ -1,3 +1,13 @@
++"""SQLite 元数据仓储层。
++
++封装所有对 SQLite 元数据库的读写操作，包括：
++- 入库运行记录（ingest_runs）
++- 审计日志（audit_logs）
++- 知识缺口事件和集群（knowledge_gap_events / knowledge_gap_clusters）
++
++所有数据模型使用 frozen dataclass 保证不可变性。
++"""
++
+ from __future__ import annotations
+ 
+ import json
+@@ -10,102 +20,275 @@ from .database import SqliteDatabase
+ 
+ 
+ def utc_now_iso() -> str:
++    """返回当前 UTC 时间的 ISO 8601 字符串。用于入库记录和审计日志的时间戳。"""
+     return datetime.now(UTC).isoformat()
+ 
+ 
+ def new_id(prefix: str) -> str:
++    """生成带前缀的唯一 ID。
++
++    格式为 ``{prefix}_{uuid4_hex}``，用于 audit_id、gap_event_id、cluster_id 等。
++    """
+     return f"{prefix}_{uuid.uuid4().hex}"
+ 
+ 
++# ═══════════════════════════════════════════════════════════════
++# 数据记录类型（frozen dataclass，不可变）
++# ═══════════════════════════════════════════════════════════════
++
++
+ @dataclass(frozen=True)
+ class IngestRunRecord:
++    """一次知识入库运行的记录。
++
++    每次执行 ``scripts/ingest_knowledge.py`` 会创建一条记录。
++    """
++
+     ingest_id: str
++    """入库运行唯一 ID。"""
++
+     knowledge_version: str
++    """本次入库生成的知识版本号。"""
++
+     started_at: str
++    """入库开始时间（ISO 8601）。"""
++
+     status: str
++    """入库状态：success / success_with_warnings / failed。"""
++
+     total_docs: int = 0
++    """处理的 Markdown 文档总数。"""
++
+     total_knowledge_items: int = 0
++    """所有文档中的知识条目总数。"""
++
+     active_items: int = 0
++    """成功入库的条目数。"""
++
+     skipped_items: int = 0
++    """跳过的条目数。"""
++
+     failed_items: int = 0
++    """入库失败的条目数。"""
++
+     finished_at: str | None = None
++    """入库完成时间。"""
++
+     qdrant_collection: str | None = None
++    """本次入库创建的 Qdrant collection 名称。"""
++
+     qdrant_alias: str | None = None
++    """关联的 Qdrant alias 名称。"""
++
+     error_message: str | None = None
++    """失败时的错误信息。"""
++
+     warnings: list[str] = field(default_factory=list)
++    """入库过程中的 warning 消息列表。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class AuditLogRecord:
++    """一条 RAG 查询的审计日志。
++
++    每次 POST /v1/rag/query 调用都会创建一条审计记录。
++    PII 字段（sessionId、userId、query）已经过脱敏/hash 处理。
++    """
++
+     audit_id: str
++    """审计日志唯一 ID。"""
++
+     request_id: str
++    """原请求的 requestId。"""
++
+     trace_id: str
++    """原请求的 traceId。"""
++
+     channel: str
++    """来源渠道。"""
++
+     query_masked: str
++    """脱敏后的查询文本。"""
++
+     status: str
++    """RAG 返回状态。"""
++
+     answerable: bool = False
++    """是否可回答。"""
++
+     confidence: float = 0.0
++    """检索置信度。"""
++
+     session_id_hash: str | None = None
++    """SHA-256 哈希后的会话 ID。"""
++
+     user_id_hash: str | None = None
++    """SHA-256 哈希后的用户 ID。"""
++
+     original_query_masked: str | None = None
++    """脱敏后的原始查询文本。"""
++
+     intent: str | None = None
++    """Agent 识别的主意图。"""
++
+     sub_intent: str | None = None
++    """Agent 识别的子意图。"""
++
+     filters: dict[str, Any] = field(default_factory=dict)
++    """检索过滤条件。"""
++
+     top_knowledge_ids: list[str] = field(default_factory=list)
++    """返回的排名前 K 知识 ID 列表。"""
++
+     top_chunk_ids: list[str] = field(default_factory=list)
++    """返回的排名前 K chunk ID 列表。"""
++
+     top_doc_ids: list[str] = field(default_factory=list)
++    """返回的排名前 K 文档 ID 列表。"""
++
+     knowledge_version: str | None = None
++    """知识库版本号。"""
++
+     latency_ms: int | None = None
++    """请求耗时（毫秒）。"""
++
+     error_code: str | None = None
++    """错误码（如有）。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class KnowledgeGapClusterRecord:
++    """一个知识缺口集群。
++
++    由 GapClusteringService 对相似的缺口事件聚类生成。
++    """
++
+     cluster_id: str
++    """集群唯一 ID。"""
++
+     representative_query: str
++    """代表性查询文本。"""
++
+     first_seen_at: str
++    """首次出现时间。"""
++
+     last_seen_at: str
++    """最近出现时间。"""
++
+     cluster_title: str | None = None
++    """LLM 生成的集群标题。"""
++
+     summary: str | None = None
++    """LLM 生成的集群摘要。"""
++
+     business_domain_guess: str | None = None
++    """推测的业务域。"""
++
+     knowledge_type_guess: str | None = None
++    """推测的知识类型。"""
++
+     owner_team: str | None = None
++    """应负责处理的团队。"""
++
+     event_count: int = 0
++    """集群包含的事件数。"""
++
+     status_breakdown: dict[str, int] = field(default_factory=dict)
++    """事件状态分布。"""
++
+     top_candidate_knowledge_ids: list[str] = field(default_factory=list)
++    """高频候选知识 ID。"""
++
+     query_examples: list[str] = field(default_factory=list)
++    """查询示例。"""
++
+     handled_status: str = "open"
++    """处理状态：open / planned / resolved / ignored。"""
+ 
+ 
+ @dataclass(frozen=True)
+ class KnowledgeGapEventRecord:
++    """一条知识缺口事件。
++
++    当 RAG 返回 not_found 或 low_confidence 时自动创建。
++    用于后续聚类分析，发现知识盲区。
++    """
++
+     gap_event_id: str
++    """缺口事件唯一 ID。"""
++
+     request_id: str
++    """原请求 ID。"""
++
+     trace_id: str
++    """原链路追踪 ID。"""
++
+     channel: str
++    """来源渠道。"""
++
+     query_masked: str
++    """脱敏后的查询文本。"""
++
+     status: str
++    """RAG 状态（not_found 或 low_confidence）。"""
++
+     confidence: float = 0.0
++    """检索置信度。"""
++
+     cluster_id: str | None = None
++    """所属集群 ID（未聚类时为 None）。"""
++
+     session_id_hash: str | None = None
++    """哈希后的会话 ID。"""
++
+     user_id_hash: str | None = None
++    """哈希后的用户 ID。"""
++
+     original_query_masked: str | None = None
++    """脱敏后的原始查询。"""
++
+     intent: str | None = None
++    """Agent 识别的主意图。"""
++
+     sub_intent: str | None = None
++    """Agent 识别的子意图。"""
++
+     filters: dict[str, Any] = field(default_factory=dict)
++    """检索过滤条件。"""
++
+     business_domain_guess: str | None = None
++    """从 filter 中提取的业务域。"""
++
+     knowledge_type_guess: str | None = None
++    """从 filter 中提取的知识类型。"""
++
+     top_candidate_knowledge_ids: list[str] = field(default_factory=list)
++    """查询时返回的候选知识 ID（尽管置信度不够）。"""
++
++
++# ═══════════════════════════════════════════════════════════════
++# 仓储类
++# ═══════════════════════════════════════════════════════════════
+ 
+ 
+ class MetadataRepository:
++    """元数据仓储。
++
++    封装所有对 SQLite 元数据库的 CRUD 操作。
++    使用时需要先调用 ``initialize()`` 确保表结构存在。
++    """
++
+     def __init__(self, database: SqliteDatabase) -> None:
+         self.database = database
+ 
+     def initialize(self) -> None:
++        """初始化数据库表结构（如不存在则创建）。幂等操作。"""
+         self.database.initialize()
+ 
++    # ── 入库记录 ─────────────────────────────────────────────
++
+     def create_ingest_run(self, record: IngestRunRecord) -> None:
++        """创建一条入库运行记录。"""
+         with self.database.connect() as connection:
+             connection.execute(
+                 """
+@@ -135,6 +318,7 @@ class MetadataRepository:
+             )
+ 
+     def get_latest_successful_ingest_run(self) -> dict[str, Any] | None:
++        """获取最近一次成功入库的运行记录。用于就绪检查时判断知识库是否已初始化。"""
+         with self.database.connect() as connection:
+             row = connection.execute(
+                 """
+@@ -146,7 +330,13 @@ class MetadataRepository:
+             ).fetchone()
+             return dict(row) if row else None
+ 
++    # ── 审计日志 ─────────────────────────────────────────────
++
+     def create_audit_log(self, record: AuditLogRecord) -> None:
++        """创建一条 RAG 查询审计日志。
++
++        所有 PII 字段在上层已通过 ``mask_text`` 和 ``hash_identifier`` 处理。
++        """
+         with self.database.connect() as connection:
+             connection.execute(
+                 """
+@@ -182,7 +372,10 @@ class MetadataRepository:
+                 ),
+             )
+ 
++    # ── 知识缺口事件 ─────────────────────────────────────────
++
+     def list_unclustered_gap_events(self, limit: int = 100) -> list[dict[str, Any]]:
++        """获取尚未分配到任何集群的缺口事件。按创建时间升序，先创建的优先处理。"""
+         with self.database.connect() as connection:
+             rows = connection.execute(
+                 """
+@@ -195,18 +388,8 @@ class MetadataRepository:
+             ).fetchall()
+         return [self._decode_gap_event_row(dict(row)) for row in rows]
+ 
+-    def list_open_gap_clusters(self) -> list[dict[str, Any]]:
+-        with self.database.connect() as connection:
+-            rows = connection.execute(
+-                """
+-                SELECT * FROM knowledge_gap_clusters
+-                WHERE handled_status = 'open'
+-                ORDER BY last_seen_at DESC
+-                """
+-            ).fetchall()
+-        return [self._decode_gap_cluster_row(dict(row)) for row in rows]
+-
+     def assign_gap_events_to_cluster(self, gap_event_ids: list[str], cluster_id: str) -> None:
++        """将一批缺口事件分配到指定集群。"""
+         if not gap_event_ids:
+             return
+         with self.database.connect() as connection:
+@@ -219,7 +402,60 @@ class MetadataRepository:
+                 [(cluster_id, gap_event_id) for gap_event_id in gap_event_ids],
+             )
+ 
++    def create_gap_event(self, record: KnowledgeGapEventRecord) -> None:
++        """创建一条缺口事件记录。在 RAG 查询返回 not_found 或 low_confidence 时调用。"""
++        with self.database.connect() as connection:
++            connection.execute(
++                """
++                INSERT INTO knowledge_gap_events (
++                    gap_event_id, cluster_id, request_id, trace_id, session_id_hash,
++                    user_id_hash, channel, original_query_masked, query_masked,
++                    intent, sub_intent, filters_json, status, confidence,
++                    business_domain_guess, knowledge_type_guess,
++                    top_candidate_knowledge_ids_json
++                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                """,
++                (
++                    record.gap_event_id,
++                    record.cluster_id,
++                    record.request_id,
++                    record.trace_id,
++                    record.session_id_hash,
++                    record.user_id_hash,
++                    record.channel,
++                    record.original_query_masked,
++                    record.query_masked,
++                    record.intent,
++                    record.sub_intent,
++                    json.dumps(record.filters, ensure_ascii=False),
++                    record.status,
++                    record.confidence,
++                    record.business_domain_guess,
++                    record.knowledge_type_guess,
++                    json.dumps(record.top_candidate_knowledge_ids, ensure_ascii=False),
++                ),
++            )
++
++    # ── 知识缺口集群 ─────────────────────────────────────────
++
++    def list_open_gap_clusters(self) -> list[dict[str, Any]]:
++        """获取所有未处理（open 状态）的缺口集群。按最近出现时间降序。"""
++        with self.database.connect() as connection:
++            rows = connection.execute(
++                """
++                SELECT * FROM knowledge_gap_clusters
++                WHERE handled_status = 'open'
++                ORDER BY last_seen_at DESC
++                """
++            ).fetchall()
++        return [self._decode_gap_cluster_row(dict(row)) for row in rows]
++
+     def upsert_gap_cluster(self, record: KnowledgeGapClusterRecord) -> None:
++        """插入或更新缺口集群。
++
++        如果 cluster_id 已存在则更新（合并新事件），否则创建新集群。
++        用于增量聚类：新事件可能合并到已有集群。
++        """
+         with self.database.connect() as connection:
+             connection.execute(
+                 """
+@@ -264,6 +500,7 @@ class MetadataRepository:
+             )
+ 
+     def create_gap_cluster(self, record: KnowledgeGapClusterRecord) -> None:
++        """创建新的缺口集群（不检查冲突）。通常使用 ``upsert_gap_cluster`` 代替。"""
+         with self.database.connect() as connection:
+             connection.execute(
+                 """
+@@ -293,39 +530,6 @@ class MetadataRepository:
+                 ),
+             )
+ 
+-    def create_gap_event(self, record: KnowledgeGapEventRecord) -> None:
+-        with self.database.connect() as connection:
+-            connection.execute(
+-                """
+-                INSERT INTO knowledge_gap_events (
+-                    gap_event_id, cluster_id, request_id, trace_id, session_id_hash,
+-                    user_id_hash, channel, original_query_masked, query_masked,
+-                    intent, sub_intent, filters_json, status, confidence,
+-                    business_domain_guess, knowledge_type_guess,
+-                    top_candidate_knowledge_ids_json
+-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+-                """,
+-                (
+-                    record.gap_event_id,
+-                    record.cluster_id,
+-                    record.request_id,
+-                    record.trace_id,
+-                    record.session_id_hash,
+-                    record.user_id_hash,
+-                    record.channel,
+-                    record.original_query_masked,
+-                    record.query_masked,
+-                    record.intent,
+-                    record.sub_intent,
+-                    json.dumps(record.filters, ensure_ascii=False),
+-                    record.status,
+-                    record.confidence,
+-                    record.business_domain_guess,
+-                    record.knowledge_type_guess,
+-                    json.dumps(record.top_candidate_knowledge_ids, ensure_ascii=False),
+-                ),
+-            )
+-
+     def update_gap_cluster_status(
+         self,
+         cluster_id: str,
+@@ -333,6 +537,11 @@ class MetadataRepository:
+         handled_by: str | None = None,
+         note: str | None = None,
+     ) -> str:
++        """更新缺口集群的处理状态。
++
++        同时会在 gap_cluster_actions 表中创建一条操作审计记录。
++        返回本次操作的 action_id。
++        """
+         action_id = new_id("gap_action")
+         with self.database.connect() as connection:
+             connection.execute(
+@@ -359,6 +568,7 @@ class MetadataRepository:
+         limit: int = 100,
+         offset: int = 0,
+     ) -> list[dict[str, Any]]:
++        """分页查询缺口集群，可按处理状态过滤。按最近出现时间降序。"""
+         with self.database.connect() as connection:
+             if handled_status:
+                 rows = connection.execute(
+@@ -382,6 +592,7 @@ class MetadataRepository:
+             return [self._decode_gap_cluster_row(dict(row)) for row in rows]
+ 
+     def get_gap_cluster(self, cluster_id: str) -> dict[str, Any] | None:
++        """按 ID 获取单个缺口集群。不存在时返回 None。"""
+         with self.database.connect() as connection:
+             row = connection.execute(
+                 """
+@@ -392,8 +603,10 @@ class MetadataRepository:
+             ).fetchone()
+         return self._decode_gap_cluster_row(dict(row)) if row else None
+ 
++    # ── 内部：JSON 字段解码 ──────────────────────────────────
+ 
+     def _decode_gap_event_row(self, row: dict[str, Any]) -> dict[str, Any]:
++        """将数据库行中的 JSON 字符串字段反序列化为 Python 对象。"""
+         row["filters"] = json.loads(row.pop("filters_json") or "{}")
+         row["top_candidate_knowledge_ids"] = json.loads(
+             row.pop("top_candidate_knowledge_ids_json") or "[]"
+@@ -401,6 +614,7 @@ class MetadataRepository:
+         return row
+ 
+     def _decode_gap_cluster_row(self, row: dict[str, Any]) -> dict[str, Any]:
++        """将数据库行中的 JSON 字符串字段反序列化为 Python 对象。"""
+         row["status_breakdown"] = json.loads(row.pop("status_breakdown_json") or "{}")
+         row["top_candidate_knowledge_ids"] = json.loads(
+             row.pop("top_candidate_knowledge_ids_json") or "[]"
+diff --git a/knowledge/account/faq.md b/knowledge/account/faq.md
+index 137195a..65b9f21 100644
+--- a/knowledge/account/faq.md
++++ b/knowledge/account/faq.md
+@@ -105,3 +105,103 @@ stationIds:
+     "notes": "账户安全边界。"
+   }
+ ]
++
++## faq_account_wx_bind_001｜微信绑定/解绑怎么操作？
++
++### Summary
++用户可以在小程序账户设置中管理微信绑定状态，解绑前需确认账户无未完结订单。
++
++### Content
++用户可以通过小程序"我的-账户设置"查看当前微信绑定状态并进行解绑或重新绑定操作。解绑前需确认账户无正在进行的充电订单、未支付的费用或未完结的退款申请。如遇到绑定失败提示，通常是微信侧授权过期或账户已被其他微信绑定，可根据页面提示处理或联系人工客服。
++
++### Allowed Claims
++- 可以在小程序"我的-账户设置"中管理微信绑定状态。
++- 解绑前需确认账户无未完结订单、未支付费用和未完结退款。
++- 绑定失败时可根据页面提示处理或联系人工客服。
++
++### Forbidden Claims
++- 可以绕过微信授权直接绑定账户。
++- 承诺解绑后一定可以重新绑定到其他微信。
++- 可以帮用户后台直接解绑。
++
++### Keywords
++- 微信绑定
++- 解绑
++- 账户设置
++- 授权
++
++### Similar Questions
++- 微信绑定怎么换？
++- 怎么解绑微信？
++- 绑定微信失败了怎么办？
++- 更换微信账号绑定
++
++### Eval Questions
++[
++  {
++    "question": "怎么解绑微信？",
++    "referenceAnswer": "用户可以通过小程序「我的-账户设置」查看当前微信绑定状态并进行解绑或重新绑定操作。解绑前需确认账户无正在进行的充电订单、未支付的费用或未完结的退款申请。",
++    "expectedContextIds": [
++      "faq_account_wx_bind_001#main"
++    ],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "可以在小程序「我的-账户设置」中管理微信绑定状态。",
++      "解绑前需确认账户无未完结订单、未支付费用和未完结退款。"
++    ],
++    "negativeContextIds": [
++      "faq_account_login_001#main"
++    ],
++    "notes": "微信绑定管理 FAQ。"
++  }
++]
++
++## faq_account_delete_001｜可以注销账户吗？
++
++### Summary
++用户需在满足注销条件后通过小程序提交注销申请，客服无法直接代为注销。
++
++### Content
++用户如需注销账户，可在小程序"我的-账户设置-注销账户"中查看注销条件。通常需要满足：无进行中的订单、无未支付费用、无余额（或余额已清零）、无未完结的退款或争议。满足条件后可提交注销申请，审核通过后账户将被注销。账户注销后数据将按隐私政策处理，部分交易记录依法保留。
++
++### Allowed Claims
++- 注销账户需满足无进行中订单、无欠费、无余额等条件。
++- 可在小程序"我的-账户设置-注销账户"中提交申请。
++- 注销后交易记录依法保留，其他数据按隐私政策处理。
++
++### Forbidden Claims
++- 客服可以帮忙直接注销账户。
++- 注销后所有数据立即删除。
++- 注销后可以恢复账户。
++
++### Keywords
++- 注销
++- 删除账户
++- 账户设置
++- 隐私
++
++### Similar Questions
++- 怎么注销账户？
++- 账户可以删除吗？
++- 注销账户要什么条件？
++- 不想用了怎么注销？
++
++### Eval Questions
++[
++  {
++    "question": "怎么注销账户？",
++    "referenceAnswer": "用户可在小程序「我的-账户设置-注销账户」中查看注销条件。满足条件后可提交注销申请，审核通过后账户将被注销。",
++    "expectedContextIds": [
++      "faq_account_delete_001#main"
++    ],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "注销账户需满足无进行中订单、无欠费、无余额等条件。",
++      "可在小程序「我的-账户设置-注销账户」中提交申请。"
++    ],
++    "negativeContextIds": [
++      "faq_account_login_001#main"
++    ],
++    "notes": "账户注销 FAQ。"
++  }
++]
+diff --git a/knowledge/charging/faq.md b/knowledge/charging/faq.md
+index 02f5cae..385a570 100644
+--- a/knowledge/charging/faq.md
++++ b/knowledge/charging/faq.md
+@@ -120,3 +120,93 @@ stationIds:
+     "notes": "区分启动充电和结束充电。"
+   }
+ ]
++
++## faq_charge_mid_stop_001｜充电中途自动停了怎么办？
++
++### Summary
++充电中途停止可能是车辆保护、设备安全策略或网络波动导致，用户可查看页面状态并尝试重新启动。
++
++### Content
++充电中途自动停止的常见原因包括：车辆电池管理系统触发保护、设备检测到异常电流或温度、网络信号波动导致通信中断。用户可先查看小程序当前充电订单页面显示的停止原因和提示，按页面指引尝试重新启动。如果多次重启无效，可更换设备或联系人工客服。已产生的电量会正常计费。
++
++### Allowed Claims
++- 充电中途停止可能是车辆保护、设备安全策略或网络波动导致。
++- 可查看页面提示并按指引尝试重新启动。
++- 多次重启无效时可更换设备或联系人工客服。
++- 已产生的电量会正常计费。
++
++### Forbidden Claims
++- 一定是设备故障。
++- 中途停止不收费。
++- 可以保证重启一定成功。
++
++### Keywords
++- 中途停止
++- 自动停
++- 充电中断
++- 重启充电
++
++### Similar Questions
++- 充到一半停了怎么办？
++- 充电自动断了什么原因？
++- 怎么充着充着就停了？
++
++### Eval Questions
++[
++  {
++    "question": "充电充到一半自动停了怎么办？",
++    "referenceAnswer": "充电中途停止可能是车辆保护、设备安全策略或网络波动导致。用户可查看页面提示并按指引尝试重新启动。多次重启无效可更换设备或联系人工客服。",
++    "expectedContextIds": ["faq_charge_mid_stop_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "充电中途停止可能是车辆保护、设备安全策略或网络波动导致。",
++      "可查看页面提示并按指引尝试重新启动。"
++    ],
++    "negativeContextIds": ["faq_charge_stop_001#main"],
++    "notes": "区分正常结束充电和异常中途停止。"
++  }
++]
++
++## faq_charge_speed_001｜充电速度太慢怎么办？
++
++### Summary
++充电速度受多种因素影响，包括车辆电池状态、设备功率、环境温度和同时充电的车辆数量。
++
++### Content
++充电速度受电池当前电量（电量较高时充电速度会降低）、车辆支持的最大充电功率、充电桩的输出功率、环境温度（过冷或过热会触发限速保护）以及站点同时充电车辆数量等因素影响。建议用户确认车辆充电设置中未开启限速模式，也可以尝试更换其他功率更高的充电桩。具体速度以实际充电过程中页面显示为准。
++
++### Allowed Claims
++- 充电速度受车辆电池状态、设备功率、环境温度和同时充电车辆数量影响。
++- 电量较高时充电速度会自然降低。
++- 可尝试更换高功率充电桩。
++
++### Forbidden Claims
++- 承诺一定能达到某个充电速度。
++- 一定是充电桩的问题。
++
++### Keywords
++- 充电慢
++- 速度
++- 功率
++- 充电时间
++
++### Similar Questions
++- 怎么充电这么慢？
++- 充电速度能快一点吗？
++- 为什么充电要这么久？
++
++### Eval Questions
++[
++  {
++    "question": "充电太慢了怎么办？",
++    "referenceAnswer": "充电速度受车辆电池状态、设备功率、环境温度和同时充电车辆数量等因素影响。电量较高时充电速度会自然降低。可尝试更换高功率充电桩。",
++    "expectedContextIds": ["faq_charge_speed_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "充电速度受车辆电池状态、设备功率、环境温度和同时充电车辆数量影响。",
++      "电量较高时充电速度会自然降低。"
++    ],
++    "negativeContextIds": ["faq_charge_scan_001#main"],
++    "notes": "充电速度 FAQ。"
++  }
++]
+diff --git a/knowledge/charging/operation_guide.md b/knowledge/charging/operation_guide.md
+index ab801e8..fef92e0 100644
+--- a/knowledge/charging/operation_guide.md
++++ b/knowledge/charging/operation_guide.md
+@@ -107,3 +107,49 @@ stationIds:
+     "notes": "预约规则指引，不承诺一定成功。"
+   }
+ ]
++
++## guide_charge_connector_001｜不同类型充电枪怎么选？
++
++### Summary
++用户应根据车辆充电接口类型选择合适的充电枪，常见有国标直流快充和交流慢充两种接口。
++
++### Content
++大力仔充电站通常提供国标直流快充（DC）和交流慢充（AC）两种充电枪。直流快充功率高、充电速度快，适合急需补电的场景；交流慢充功率较低，适合长时间停放时使用。用户在选择充电枪时，应确认车辆支持的接口类型，将对应型号的充电枪正确连接车辆。如果接口不匹配，请勿强行连接，可更换其他设备或联系客服。
++
++### Allowed Claims
++- 充电站通常提供直流快充和交流慢充两种充电枪。
++- 直流快充适合急需补电，交流慢充适合长时间停放充电。
++- 接口不匹配时请勿强行连接。
++
++### Forbidden Claims
++- 所有车辆都支持所有接口类型。
++- 强行连接不匹配的接口不会有问题。
++
++### Keywords
++- 充电枪
++- 接口
++- 快充
++- 慢充
++- 直流
++- 交流
++
++### Similar Questions
++- 快充和慢充有什么区别？
++- 用哪个充电枪？
++- 接口不匹配怎么办？
++
++### Eval Questions
++[
++  {
++    "question": "快充和慢充用哪个？",
++    "referenceAnswer": "直流快充功率高、充电速度快，适合急需补电；交流慢充功率较低，适合长时间停放时使用。用户应确认车辆支持的接口类型，将对应充电枪正确连接。",
++    "expectedContextIds": ["guide_charge_connector_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "充电站通常提供直流快充和交流慢充两种充电枪。",
++      "直流快充适合急需补电，交流慢充适合长时间停放充电。"
++    ],
++    "negativeContextIds": ["guide_charge_prepare_001#main"],
++    "notes": "区分充电前准备和接口选择。"
++  }
++]
+diff --git a/knowledge/coupon/coupon_policy.md b/knowledge/coupon/coupon_policy.md
+index 0c9063b..d654adf 100644
+--- a/knowledge/coupon/coupon_policy.md
++++ b/knowledge/coupon/coupon_policy.md
+@@ -106,3 +106,97 @@ stationIds:
+     "notes": "区分卡券叠加和卡券不展示。"
+   }
+ ]
++
++## coupon_expire_001｜卡券过期了还能用吗？
++
++### Summary
++已过期的卡券无法使用，建议用户在有效期内及时使用，过期的卡券通常不予补发。
++
++### Content
++卡券均有明确的有效期，用户可以在卡券详情页查看。已过有效期的卡券无法在订单结算时使用，系统会自动过滤已过期卡券。一般情况下过期卡券不予补发或延期，具体以活动规则为准。建议用户定期查看"我的卡券"页面，在有效期内合理安排使用。
++
++### Allowed Claims
++- 过期卡券无法在订单结算时使用。
++- 一般情况下过期卡券不予补发或延期。
++- 建议用户在有效期内及时使用卡券。
++
++### Forbidden Claims
++- 可以帮忙给过期卡券延期。
++- 过期卡券一定能补发。
++- 承诺卡券可以无限期使用。
++
++### Keywords
++- 过期
++- 有效期
++- 卡券
++- 补发
++
++### Similar Questions
++- 优惠券过期了还能用吗？
++- 过了期的券怎么办？
++- 能不能延长卡券时间？
++
++### Eval Questions
++[
++  {
++    "question": "优惠券过期了还能用吗？",
++    "referenceAnswer": "已过期的卡券无法使用。一般情况下过期卡券不予补发或延期，具体以活动规则为准。建议用户在有效期内及时使用。",
++    "expectedContextIds": ["coupon_expire_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "过期卡券无法在订单结算时使用。",
++      "一般情况下过期卡券不予补发或延期。"
++    ],
++    "negativeContextIds": ["coupon_stack_001#main"],
++    "notes": "卡券过期规则。"
++  }
++]
++
++## coupon_obtain_001｜怎么获取优惠券？
++
++### Summary
++用户可通过小程序活动页面、任务中心、邀请好友等方式获取卡券，具体以页面展示为准。
++
++### Content
++卡券的获取方式包括但不限于：参与小程序内活动、完成任务中心任务、邀请新用户注册、节假日专属福利等。用户可以在小程序"我的-卡券中心"或活动页面查看当前可获取的卡券。不同活动的发放规则、数量限制和使用条件可能不同，具体以活动规则描述为准。
++
++### Allowed Claims
++- 卡券可通过活动页面、任务中心、邀请好友等方式获取。
++- 可在小程序"我的-卡券中心"查看当前可获取的卡券。
++- 不同活动的发放规则和使用条件可能不同。
++
++### Forbidden Claims
++- 客服可以私下给用户发优惠券。
++- 承诺一定可以获取某张卡券。
++- 可以绕过活动规则发放卡券。
++
++### Keywords
++- 获取卡券
++- 领券
++- 活动
++- 优惠券
++
++### Similar Questions
++- 怎么领优惠券？
++- 哪里可以领券？
++- 有什么活动可以拿券？
++
++### Eval Questions
++[
++  {
++    "question": "哪里可以领优惠券？",
++    "referenceAnswer": "用户可通过小程序活动页面、任务中心、邀请好友等方式获取卡券。可在小程序「我的-卡券中心」查看当前可获取的卡券。不同活动的发放规则可能不同。",
++    "expectedContextIds": [
++      "coupon_obtain_001#main"
++    ],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "卡券可通过活动页面、任务中心、邀请好友等方式获取。",
++      "可在小程序「我的-卡券中心」查看当前可获取的卡券。"
++    ],
++    "negativeContextIds": [
++      "coupon_stack_001#main"
++    ],
++    "notes": "卡券获取方式。"
++  }
++]
+diff --git a/knowledge/customer_service/handoff_guide.md b/knowledge/customer_service/handoff_guide.md
+index 9bac18f..281a0e1 100644
+--- a/knowledge/customer_service/handoff_guide.md
++++ b/knowledge/customer_service/handoff_guide.md
+@@ -108,3 +108,51 @@ stationIds:
+     "notes": "投诉入口。"
+   }
+ ]
++
++## handoff_working_hours_001｜人工客服工作时间是什么？
++
++### Summary
++人工客服在线时间以小程序客服页面标注为准，非工作时间可通过留言或自助服务处理。
++
++### Content
++人工客服的在线服务时间通常为每日 8:00-22:00，具体以小程序"我的-联系客服"页面展示为准。在非在线时段，用户可以通过留言功能提交问题，客服会在下一个工作日回复。常见问题（如扫码充电、查看订单、卡券使用）建议优先使用小程序内自助功能和 FAQ 查询。
++
++### Allowed Claims
++- 人工客服在线时间以小程序页面标注为准。
++- 非工作时间可通过留言提交问题。
++- 常见问题建议优先使用自助功能。
++
++### Forbidden Claims
++- 承诺 24 小时都有人工客服在线。
++- 承诺一定在某个时间点回复。
++
++### Keywords
++- 客服时间
++- 在线时间
++- 人工服务
++- 工作时间
++
++### Similar Questions
++- 客服几点上班？
++- 晚上有客服吗？
++- 现在有人工客服吗？
++
++### Eval Questions
++[
++  {
++    "question": "人工客服几点上班？",
++    "referenceAnswer": "人工客服在线服务时间通常为每日 8:00-22:00，具体以小程序「我的-联系客服」页面展示为准。非工作时间可通过留言提交问题。",
++    "expectedContextIds": [
++      "handoff_working_hours_001#main"
++    ],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "人工客服在线时间以小程序页面标注为准。",
++      "非工作时间可通过留言提交问题。"
++    ],
++    "negativeContextIds": [
++      "handoff_complaint_001#main"
++    ],
++    "notes": "区分投诉入口和客服时间。"
++  }
++]
+diff --git a/knowledge/customer_service/risk_notice.md b/knowledge/customer_service/risk_notice.md
+index 34862fb..3b9a0bc 100644
+--- a/knowledge/customer_service/risk_notice.md
++++ b/knowledge/customer_service/risk_notice.md
+@@ -110,3 +110,47 @@ stationIds:
+     "notes": "业务真值边界。"
+   }
+ ]
++
++## risk_privacy_001｜用户的个人信息会泄露吗？
++
++### Summary
++平台严格遵循隐私政策保护用户信息，客服不会索取密码等敏感信息，也不会透露其他用户信息。
++
++### Content
++大力仔平台严格遵循隐私政策和相关法律法规保护用户个人信息。用户在小程序内提交的个人信息仅用于提供充电服务及相关功能。客服人员在提供服务时不会向用户索要支付密码、短信验证码等敏感信息。如用户接到疑似诈骗电话或信息，请勿透露个人信息并通过官方渠道联系客服核实。
++
++### Allowed Claims
++- 平台严格遵循隐私政策保护用户个人信息。
++- 客服不会索要支付密码、短信验证码等敏感信息。
++- 接到可疑信息请通过官方渠道核实。
++
++### Forbidden Claims
++- 绝对不会发生信息泄露。
++- 可以帮用户查询其他用户的账户信息。
++
++### Keywords
++- 隐私
++- 个人信息
++- 安全
++- 诈骗
++
++### Similar Questions
++- 我的信息会不会泄露？
++- 客服会要我的密码吗？
++- 怎么防范诈骗？
++
++### Eval Questions
++[
++  {
++    "question": "客服会找我要密码吗？",
++    "referenceAnswer": "客服人员在提供服务时不会向用户索要支付密码、短信验证码等敏感信息。如接到可疑信息请通过官方渠道核实。",
++    "expectedContextIds": ["risk_privacy_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "平台严格遵循隐私政策保护用户个人信息。",
++      "客服不会索要支付密码、短信验证码等敏感信息。"
++    ],
++    "negativeContextIds": ["risk_biz_boundary_001#main"],
++    "notes": "区分业务边界和隐私安全。"
++  }
++]
+diff --git a/knowledge/device/troubleshooting.md b/knowledge/device/troubleshooting.md
+index 51000e5..3df1cc1 100644
+--- a/knowledge/device/troubleshooting.md
++++ b/knowledge/device/troubleshooting.md
+@@ -106,3 +106,93 @@ stationIds:
+     "notes": "设备安全类故障排查。"
+   }
+ ]
++
++## trouble_device_offline_001｜充电桩显示离线怎么办？
++
++### Summary
++设备显示离线可能是网络通信异常或设备维护中，用户可尝试更换其他设备或联系客服反馈。
++
++### Content
++如果用户在小程序上看到某台充电桩显示"离线"状态，说明设备当前无法正常通信。常见原因包括：设备网络模块故障、站点网络信号不稳定、设备正在进行维护或升级。建议用户选择同一站点其他在线的充电桩使用。如果所有设备都离线，可以联系人工客服反馈站点情况。
++
++### Allowed Claims
++- 设备离线可能是网络通信异常或设备维护导致。
++- 建议选择其他在线设备使用。
++- 所有设备都离线时可联系客服反馈。
++
++### Forbidden Claims
++- 一定是设备损坏。
++- 可以帮用户远程修复设备。
++- 承诺设备何时恢复在线。
++
++### Keywords
++- 离线
++- 不可用
++- 设备故障
++- 网络异常
++
++### Similar Questions
++- 充电桩离线了怎么充？
++- 设备显示不在线？
++- 所有桩都不能用？
++
++### Eval Questions
++[
++  {
++    "question": "充电桩显示离线怎么办？",
++    "referenceAnswer": "设备显示离线可能是网络通信异常或设备维护导致。建议选择其他在线设备使用。所有设备都离线时可联系客服反馈站点情况。",
++    "expectedContextIds": ["trouble_device_offline_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "设备离线可能是网络通信异常或设备维护导致。",
++      "建议选择其他在线设备使用。"
++    ],
++    "negativeContextIds": ["trouble_connector_locked_001#main"],
++    "notes": "区分枪锁故障和设备离线。"
++  }
++]
++
++## trouble_screen_error_001｜充电桩屏幕显示错误代码怎么办？
++
++### Summary
++设备屏幕显示错误代码时，用户应记录错误码并按页面提示操作，必要时联系客服。
++
++### Content
++充电桩屏幕或小程序页面显示错误代码时，通常表示设备自检发现了异常。用户可以截图或记录错误代码，按页面提示尝试重新操作。如错误持续，建议更换其他设备并联系客服反馈错误代码和设备编号，以便运营团队排查处理。不同错误代码的含义需要由设备厂商或运维团队确认。
++
++### Allowed Claims
++- 错误代码表示设备自检发现异常。
++- 建议记录错误码并尝试重新操作。
++- 错误持续时可更换设备并联系客服反馈。
++
++### Forbidden Claims
++- 可以帮用户远程清除设备错误。
++- 知道所有错误代码的含义。
++- 一定是用户操作导致的。
++
++### Keywords
++- 错误代码
++- 屏幕报错
++- 故障码
++- 设备异常
++
++### Similar Questions
++- 屏幕显示错误码怎么办？
++- 桩上报错什么原因？
++- E001 是什么意思？
++
++### Eval Questions
++[
++  {
++    "question": "充电桩屏幕上显示了错误代码怎么办？",
++    "referenceAnswer": "设备屏幕显示错误代码时，用户可以截图或记录错误代码，按页面提示尝试重新操作。如错误持续，建议更换其他设备并联系客服反馈。",
++    "expectedContextIds": ["trouble_screen_error_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "错误代码表示设备自检发现异常。",
++      "建议记录错误码并尝试重新操作。"
++    ],
++    "negativeContextIds": ["trouble_device_offline_001#main"],
++    "notes": "区分设备离线和错误代码。"
++  }
++]
+diff --git a/knowledge/invoice/operation_guide.md b/knowledge/invoice/operation_guide.md
+index 786578a..5b5ef16 100644
+--- a/knowledge/invoice/operation_guide.md
++++ b/knowledge/invoice/operation_guide.md
+@@ -108,3 +108,94 @@ stationIds:
+     "notes": "发票修改边界。"
+   }
+ ]
++
++## invoice_electronic_001｜电子发票和纸质发票怎么选？
++
++### Summary
++第一版默认提供电子发票，用户可在小程序发票页面申请并填写接收信息。
++
++### Content
++大力仔平台默认提供增值税电子普通发票。用户在订单完成后可在小程序"我的-发票管理"中选择对应订单申请开票，填写发票抬头、税号和接收邮箱。电子发票开具后会发送到用户填写的邮箱，也可在小程序内下载。目前暂不支持纸质发票邮寄。企业用户如需增值税专用发票，请联系客服确认是否支持。
++
++### Allowed Claims
++- 平台默认提供电子发票，用户可在小程序发票页面申请。
++- 电子发票开具后发送至用户邮箱并可下载。
++- 目前暂不支持纸质发票邮寄。
++
++### Forbidden Claims
++- 一定可以开具增值税专用发票。
++- 承诺发票一定在某个时间点开具完成。
++- 可以帮用户修改已开具的发票信息。
++
++### Keywords
++- 电子发票
++- 纸质发票
++- 开票
++- 发票类型
++
++### Similar Questions
++- 怎么开发票？
++- 电子发票还是纸质发票？
++- 发票怎么选的？
++
++### Eval Questions
++[
++  {
++    "question": "电子发票怎么开？",
++    "referenceAnswer": "用户可在小程序「我的-发票管理」中选择对应订单申请开票，填写发票抬头、税号和接收邮箱。电子发票开具后会发送到用户邮箱。",
++    "expectedContextIds": [
++      "invoice_electronic_001#main"
++    ],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "平台默认提供电子发票，用户可在小程序发票页面申请。",
++      "电子发票开具后发送至用户邮箱并可下载。"
++    ],
++    "negativeContextIds": [],
++    "notes": "发票类型选择。"
++  }
++]
++
++## invoice_timeline_001｜发票多久能开出来？
++
++### Summary
++电子发票通常在申请提交后几个工作日内开具，具体时间以开票系统实际处理为准。
++
++### Content
++用户提交发票申请后，开票系统会在审核通过后自动开具电子发票。一般情况下，电子发票在申请提交后 1-3 个工作日内开具并发送至用户填写的邮箱。如遇节假日或开票申请高峰期，处理时间可能延长。如超过预期时间仍未收到，用户可查看发票申请状态或联系客服查询进度。
++
++### Allowed Claims
++- 电子发票通常在申请提交后 1-3 个工作日内开具。
++- 节假日或高峰期处理时间可能延长。
++- 超过预期时间可联系客服查询进度。
++
++### Forbidden Claims
++- 发票一定在 24 小时内开具。
++- 可以承诺一个确切的开票完成时间。
++
++### Keywords
++- 发票时间
++- 开票进度
++- 电子发票
++- 审核
++
++### Similar Questions
++- 发票什么时候能开好？
++- 申请了发票多久到？
++- 怎么发票还没收到？
++
++### Eval Questions
++[
++  {
++    "question": "发票什么时候能开好？",
++    "referenceAnswer": "电子发票通常在申请提交后 1-3 个工作日内开具并发送至用户邮箱。节假日或高峰期处理时间可能延长。超过预期时间可联系客服查询进度。",
++    "expectedContextIds": ["invoice_timeline_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "电子发票通常在申请提交后 1-3 个工作日内开具。",
++      "节假日或高峰期处理时间可能延长。"
++    ],
++    "negativeContextIds": ["invoice_electronic_001#main"],
++    "notes": "区分发票类型和开票时间。"
++  }
++]
+diff --git a/knowledge/order/faq.md b/knowledge/order/faq.md
+index d972dc7..879c36d 100644
+--- a/knowledge/order/faq.md
++++ b/knowledge/order/faq.md
+@@ -106,3 +106,96 @@ stationIds:
+     "notes": "RAG 边界，Agent 应调用订单 MCP。"
+   }
+ ]
++
++## faq_order_history_001｜怎么查看历史订单？
++
++### Summary
++用户可以通过小程序"我的-订单"页面查看历史充电订单记录。
++
++### Content
++用户可以通过进入小程序"我的-我的订单"页面，按时间筛选查看历史充电订单。订单列表展示每次充电的基本信息，包括充电时间、站点、金额和状态。点击单条订单可查看详细信息。如历史订单未显示或有疑问，可联系人工客服协助查询。
++
++### Allowed Claims
++- 可以在小程序"我的-我的订单"页面查看历史订单。
++- 订单列表展示充电时间、站点、金额和状态。
++- 历史订单未显示时可联系客服协助查询。
++
++### Forbidden Claims
++- 可以帮用户删除订单记录。
++- 所有历史订单永久保留。
++
++### Keywords
++- 历史订单
++- 订单记录
++- 消费记录
++- 充电记录
++
++### Similar Questions
++- 怎么看以前的订单？
++- 充电记录在哪里？
++- 历史消费怎么查？
++
++### Eval Questions
++[
++  {
++    "question": "怎么看历史充电记录？",
++    "referenceAnswer": "用户可以在小程序「我的-我的订单」页面按时间筛选查看历史充电订单。订单列表展示每次充电的基本信息。如历史订单未显示可联系客服。",
++    "expectedContextIds": [
++      "faq_order_history_001#main"
++    ],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "可以在小程序「我的-我的订单」页面查看历史订单。",
++      "订单列表展示充电时间、站点、金额和状态。"
++    ],
++    "negativeContextIds": [
++      "faq_order_detail_001#main"
++    ],
++    "notes": "区分订单详情和历史查询。"
++  }
++]
++
++## faq_order_cancel_001｜可以取消正在进行的订单吗？
++
++### Summary
++充电中的订单能否取消取决于当前订单状态和平台规则，用户可在订单页面查看是否支持取消操作。
++
++### Content
++如果用户希望取消正在进行中的充电订单，可进入小程序当前订单页面查看是否提供取消入口。充电启动后短时间内可能支持取消，但已产生计费的订单通常无法直接取消，需要先结束充电后再处理。特殊情况下如需取消，可联系人工客服说明情况，客服会根据实际订单状态和平台规则协助处理。
++
++### Allowed Claims
++- 充电订单能否取消取决于订单状态和平台规则。
++- 可在订单页面查看是否提供取消操作。
++- 特殊情况可联系客服协助处理。
++
++### Forbidden Claims
++- 所有订单都可以随时取消。
++- 客服可以直接取消任何订单。
++- 取消订单一定全额退款。
++
++### Keywords
++- 取消订单
++- 停止订单
++- 订单操作
++- 退款
++
++### Similar Questions
++- 订单可以取消吗？
++- 不想充了能取消吗？
++- 怎么取消充电订单？
++
++### Eval Questions
++[
++  {
++    "question": "充电订单可以取消吗？",
++    "referenceAnswer": "充电订单能否取消取决于订单状态和平台规则。用户可在订单页面查看是否提供取消操作。特殊情况可联系客服协助处理。",
++    "expectedContextIds": ["faq_order_cancel_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "充电订单能否取消取决于订单状态和平台规则。",
++      "可在订单页面查看是否提供取消操作。"
++    ],
++    "negativeContextIds": ["faq_order_detail_001#main"],
++    "notes": "取消订单规则。"
++  }
++]
+diff --git a/knowledge/payment/billing_policy.md b/knowledge/payment/billing_policy.md
+index 69b622d..a10e6fd 100644
+--- a/knowledge/payment/billing_policy.md
++++ b/knowledge/payment/billing_policy.md
+@@ -109,3 +109,96 @@ stationIds:
+     "notes": "该问题在 Agent 中应优先查订单 MCP，RAG 仅作为规则说明。"
+   }
+ ]
++
++## bill_prepaid_001｜余额不足时会怎样？
++
++### Summary
++余额低于一定金额时，系统会在充电前和充电过程中进行提示，不足时可能暂停或拒绝启动充电。
++
++### Content
++当用户账户余额低于站点设定的最低金额时，系统在启动充电前会提示余额不足并引导用户充值。充电过程中如果余额被消耗至过低，系统可能会根据站点策略自动暂停充电并通知用户充值。建议用户开启自动充值功能或在充电前确保账户余额充足，避免充电中断。具体最低余额要求以各站点设置为准。
++
++### Allowed Claims
++- 余额不足时系统会在启动前或充电中提示用户。
++- 余额过低可能导致充电暂停或拒绝启动。
++- 建议充电前确保余额充足或开启自动充值。
++
++### Forbidden Claims
++- 余额不足也能无限充电。
++- 承诺一个具体的最低余额数字。
++- 自动充值一定能成功。
++
++### Keywords
++- 余额不足
++- 充值
++- 自动充值
++- 最低余额
++
++### Similar Questions
++- 余额不够了会怎么样？
++- 充到一半没钱了怎么办？
++- 怎么设置自动充值？
++
++### Eval Questions
++[
++  {
++    "question": "余额不够了会停止充电吗？",
++    "referenceAnswer": "余额不足时系统会在充电前和充电过程中提示用户。余额过低可能导致充电暂停或拒绝启动。建议充电前确保余额充足或开启自动充值功能。",
++    "expectedContextIds": ["bill_prepaid_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "余额不足时系统会在启动前或充电中提示用户。",
++      "余额过低可能导致充电暂停或拒绝启动。"
++    ],
++    "negativeContextIds": ["bill_fee_rule_001#main"],
++    "notes": "区分计费规则和余额不足处理。"
++  }
++]
++
++## bill_payment_method_001｜支持哪些支付方式？
++
++### Summary
++平台支持微信支付和账户余额支付，用户可在支付设置中管理支付方式。
++
++### Content
++目前大力仔小程序支持微信支付和账户余额支付两种方式。用户可以在小程序"我的-支付设置"中绑定微信支付、管理支付顺序。充电费用默认从账户余额扣除，余额不足时将使用微信支付补足（如已绑定）。具体支持的支付方式以支付页面展示为准。
++
++### Allowed Claims
++- 平台支持微信支付和账户余额支付。
++- 可在"我的-支付设置"中管理支付方式。
++- 充电费用默认从余额扣除，不足时可用微信支付补足。
++
++### Forbidden Claims
++- 支持所有第三方支付方式。
++- 支付方式一定可以随时切换。
++
++### Keywords
++- 支付方式
++- 微信支付
++- 余额支付
++- 绑定支付
++
++### Similar Questions
++- 可以用微信支付吗？
++- 怎么绑定支付方式？
++- 支持什么支付？
++
++### Eval Questions
++[
++  {
++    "question": "可以用微信支付充电吗？",
++    "referenceAnswer": "平台支持微信支付和账户余额支付两种方式。充电费用默认从账户余额扣除，余额不足时可用微信支付补足。可在「我的-支付设置」中管理支付方式。",
++    "expectedContextIds": [
++      "bill_payment_method_001#main"
++    ],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "平台支持微信支付和账户余额支付。",
++      "可在「我的-支付设置」中管理支付方式。"
++    ],
++    "negativeContextIds": [
++      "bill_fee_rule_001#main"
++    ],
++    "notes": "支付方式说明。"
++  }
++]
+diff --git a/knowledge/refund/refund_policy.md b/knowledge/refund/refund_policy.md
+index aeaae83..512f326 100644
+--- a/knowledge/refund/refund_policy.md
++++ b/knowledge/refund/refund_policy.md
+@@ -108,3 +108,92 @@ stationIds:
+     "notes": "高风险资金问题，RAG 只说明规则。"
+   }
+ ]
++
++## refund_partial_001｜充了一半不想充了能退钱吗？
++
++### Summary
++充电费用按实际充电量计费，结束充电后按实际产生的费用结算，未使用的部分不产生费用。
++
++### Content
++充电费用是按实际充电量（度）乘以单价计算的，而非按时间预付。用户结束充电后，系统根据实际充电量生成账单，只收取已充电量的费用。因此不存在"充了一半退一半"的情况——未充的电量根本不产生费用。如果用户对账单金额有疑问，可在订单详情页查看费用明细或联系客服核实。
++
++### Allowed Claims
++- 充电费用按实际充电量计费，结束充电后生成账单。
++- 未使用的电量不产生费用。
++- 对账单有疑问可在订单详情查看或联系客服核实。
++
++### Forbidden Claims
++- 承诺一定可以退还部分费用。
++- 可以在未结束充电时预估最终费用。
++
++### Keywords
++- 退费
++- 部分退款
++- 实际充电量
++- 按量计费
++
++### Similar Questions
++- 充一半能退吗？
++- 不想充满了剩下的钱退不？
++- 不到预想的时间能退款吗？
++
++### Eval Questions
++[
++  {
++    "question": "充到一半不想充了能退钱吗？",
++    "referenceAnswer": "充电费用按实际充电量计费，结束充电后按实际产生的费用结算。未使用的电量不产生费用。对账单有疑问可在订单详情页查看或联系客服。",
++    "expectedContextIds": ["refund_partial_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "充电费用按实际充电量计费，结束充电后生成账单。",
++      "未使用的电量不产生费用。"
++    ],
++    "negativeContextIds": ["refund_arrival_001#main"],
++    "notes": "区分退款到账时间和部分退费。"
++  }
++]
++
++## refund_fail_001｜多扣了钱怎么退款？
++
++### Summary
++用户对账单金额有异议时，可在订单详情页提交申诉或联系客服核实处理。
++
++### Content
++如果用户认为某笔充电订单存在多扣费的情况，可以先在小程序订单详情页查看费用明细（充电量、单价、时长、优惠等），确认是否存在误解。如确实异常，用户可通过订单页面的申诉入口提交申诉，或联系人工客服提供订单编号和问题描述。客服会核实账单并在确认异常后按平台退款规则处理。退款到账时间见退款规则说明。
++
++### Allowed Claims
++- 对账单有异议可查看费用明细并提交申诉。
++- 客服会核实账单，确认异常后按退款规则处理。
++- 具体退款到账时间见退款规则说明。
++
++### Forbidden Claims
++- 承诺一定退款。
++- 不需要核实就可以直接退款。
++- 可以告知具体到账时间。
++
++### Keywords
++- 多扣费
++- 账单异常
++- 申诉
++- 退差价
++
++### Similar Questions
++- 多扣钱了怎么办？
++- 扣费不对怎么退？
++- 账单有问题找谁？
++
++### Eval Questions
++[
++  {
++    "question": "感觉多扣钱了怎么退款？",
++    "referenceAnswer": "用户可先查看订单费用明细确认是否存在误解。如确实异常，可通过订单页申诉入口提交申诉或联系客服提供订单编号。客服核实确认异常后按退款规则处理。",
++    "expectedContextIds": ["refund_fail_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "对账单有异议可查看费用明细并提交申诉。",
++      "客服会核实账单，确认异常后按退款规则处理。"
++    ],
++    "negativeContextIds": ["refund_arrival_001#main", "refund_balance_rule_001#main"],
++    "notes": "区分退款到账、余额提现和多扣费申诉。"
++  }
++]
+diff --git a/knowledge/station/service_rule.md b/knowledge/station/service_rule.md
+index 879a328..6f80b3e 100644
+--- a/knowledge/station/service_rule.md
++++ b/knowledge/station/service_rule.md
+@@ -105,3 +105,135 @@ stationIds:
+     "notes": "站点导航规则。"
+   }
+ ]
++
++## station_parking_001｜充电站可以免费停车吗？
++
++### Summary
++不同站点的停车政策不同，部分站点充电期间可享受停车优惠，具体以站点页面说明为准。
++
++### Content
++大力仔合作站点的停车政策由场站管理方制定，各站点规则可能不同。部分站点在充电期间提供免费停车时长或停车费减免，具体优惠条件和时长以站点详情页标注为准。用户到达站点前可在小程序站点详情页查看停车说明和收费标准。充电结束后如超出免费时长，可能需要支付停车费。对停车费有疑问可联系场站管理方或客服协助。
++
++### Allowed Claims
++- 各站点停车政策不同，充电期间可能有停车优惠。
++- 具体停车规则以站点详情页标注为准。
++- 超出免费时长可能需要支付停车费。
++
++### Forbidden Claims
++- 所有充电站都免费停车。
++- 一定可以享受停车优惠。
++
++### Keywords
++- 停车
++- 免费停车
++- 停车费
++- 站点
++
++### Similar Questions
++- 充电要停车费吗？
++- 充电可以免费停多久？
++- 怎么充电站还要收停车费？
++
++### Eval Questions
++[
++  {
++    "question": "充电的时候停车免费吗？",
++    "referenceAnswer": "各站点停车政策不同，部分站点充电期间提供免费停车时长或停车费减免。具体以站点详情页标注为准。超出免费时长可能需要支付停车费。",
++    "expectedContextIds": ["station_parking_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "各站点停车政策不同，充电期间可能有停车优惠。",
++      "具体停车规则以站点详情页标注为准。"
++    ],
++    "negativeContextIds": ["station_nav_001#main"],
++    "notes": "区分站点导航和停车规则。"
++  }
++]
++
++## station_facility_001｜充电站有什么配套设施？
++
++### Summary
++各充电站配套设施不同，用户可在小程序站点详情页查看该站点提供的设施信息。
++
++### Content
++大力仔充电站的配套设施因站点位置和规模而异。常见配套设施包括：卫生间、休息区、便利店、WiFi 等。部分站点可能提供餐饮、自动售货机等服务。用户在到达前可在小程序站点详情页查看该站点的配套设施列表和实景图片。如需特定设施（如无障碍通道、母婴室等），建议提前查看站点信息或联系客服确认。
++
++### Allowed Claims
++- 各站点配套设施不同，常见有卫生间、休息区、便利店等。
++- 可在小程序站点详情页查看设施信息。
++- 有特殊设施需求可联系客服确认。
++
++### Forbidden Claims
++- 所有站点都有全套配套设施。
++- 承诺某站点一定有某设施。
++
++### Keywords
++- 配套设施
++- 卫生间
++- 休息区
++- 便利店
++
++### Similar Questions
++- 充电站有卫生间吗？
++- 充电站有没有便利店？
++- 充电的时候能休息吗？
++
++### Eval Questions
++[
++  {
++    "question": "充电站有卫生间吗？",
++    "referenceAnswer": "各站点配套设施不同。常见配套设施包括卫生间、休息区、便利店等。用户可在小程序站点详情页查看该站点的设施信息。有特殊需求可联系客服确认。",
++    "expectedContextIds": ["station_facility_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "各站点配套设施不同，常见有卫生间、休息区、便利店等。",
++      "可在小程序站点详情页查看设施信息。"
++    ],
++    "negativeContextIds": ["station_nav_001#main", "station_parking_001#main"],
++    "notes": "区分站点导航、停车和设施。"
++  }
++]
++
++## station_hours_001｜充电站营业时间是怎样的？
++
++### Summary
++多数充电站 24 小时运营，但部分站点可能有限时开放或特殊营业时间，以站点详情页为准。
++
++### Content
++大力仔大部分合作充电站为 24 小时全天候运营，用户可随时前往充电。但部分位于商场、写字楼、小区内的站点可能受物业或场地方管理限制，存在限时开放的情况（如仅白天开放或夜间关闭）。用户在前往充电前，建议在小程序站点详情页查看该站点的营业时间标注。如遇标注为"24小时"但实际无法进入的情况，可联系客服反馈。
++
++### Allowed Claims
++- 多数充电站 24 小时运营，但部分站点可能有限时开放。
++- 具体营业时间以站点详情页标注为准。
++- 标注与实际不符可联系客服反馈。
++
++### Forbidden Claims
++- 所有站点都是 24 小时营业。
++- 承诺某站点一定能进。
++
++### Keywords
++- 营业时间
++- 开放时间
++- 24小时
++- 站点
++
++### Similar Questions
++- 充电站晚上能去吗？
++- 站点几点关门？
++- 凌晨能充电吗？
++
++### Eval Questions
++[
++  {
++    "question": "充电站晚上可以去吗？",
++    "referenceAnswer": "多数充电站 24 小时运营，但部分位于商场、小区内的站点可能有限时开放。具体营业时间以站点详情页标注为准。标注不符可联系客服反馈。",
++    "expectedContextIds": ["station_hours_001#main"],
++    "expectedStatus": "success",
++    "expectedClaims": [
++      "多数充电站 24 小时运营，但部分站点可能有限时开放。",
++      "具体营业时间以站点详情页标注为准。"
++    ],
++    "negativeContextIds": ["station_nav_001#main"],
++    "notes": "区分导航和营业时间。"
++  }
++]
+diff --git a/scripts/check_dashscope.py b/scripts/check_dashscope.py
+index 6439789..5189a79 100644
+--- a/scripts/check_dashscope.py
++++ b/scripts/check_dashscope.py
+@@ -1,4 +1,11 @@
+-"""Check DashScope embedding and rerank connectivity."""
++"""DashScope 连通性检查脚本。
++
++验证 Embedding 和 Rerank API 是否可用。
++使用示例查询和文档进行实际调用，检查返回结果的格式和维度。
++
++用法：
++    python scripts/check_dashscope.py
++"""
+ 
+ from __future__ import annotations
+ 
+diff --git a/scripts/cluster_gap_events.py b/scripts/cluster_gap_events.py
+index 4808d80..176f4cf 100644
+--- a/scripts/cluster_gap_events.py
++++ b/scripts/cluster_gap_events.py
+@@ -1,4 +1,13 @@
+-"""Cluster unassigned knowledge gap events."""
++"""知识缺口聚类脚本。
++
++将尚未分配的知识缺口事件按语义相似度聚类，归入已有集群或创建新集群。
++支持 dry-run 模式预览结果和 --disable-llm 模式跳过 LLM 摘要生成。
++
++用法：
++    python scripts/cluster_gap_events.py                          # 默认聚类
++    python scripts/cluster_gap_events.py --dry-run                # 仅预览
++    python scripts/cluster_gap_events.py --disable-llm            # 仅用规则生成标题
++"""
+ 
+ from __future__ import annotations
+ 
+diff --git a/scripts/ingest_knowledge.py b/scripts/ingest_knowledge.py
+index 6cfb1f4..96dc13d 100644
+--- a/scripts/ingest_knowledge.py
++++ b/scripts/ingest_knowledge.py
+@@ -1,4 +1,17 @@
+-"""Validate and ingest knowledge Markdown files into Qdrant."""
++"""知识入库脚本。
++
++完整流程：
++1. 解析 knowledge/ 目录下所有 Markdown 文件。
++2. 校验知识格式和完整性。
++3. 调用 DashScope Embedding API 将所有条目向量化（每批 20 条）。
++4. 在 Qdrant 中创建新的 build collection，批量写入向量和 payload。
++5. 原子切换 Qdrant alias 到新 collection（零停机更新）。
++6. 在元数据库中记录本次入库运行。
++
++用法：
++    python scripts/ingest_knowledge.py --validate-only              # 仅校验
++    python scripts/ingest_knowledge.py --require-eval-questions     # 入库且要求评测问题
++"""
+ 
+ from __future__ import annotations
+ 
+@@ -49,6 +62,8 @@ def batched(items: list, batch_size: int):
+ 
+ 
+ def main() -> int:
++    """主入库流程入口。返回 0 成功，1 失败。"""
++    # 延迟导入，避免脚本启动时的额外开销
+     from apps.rag_service.app.ingestion import (
+         KnowledgeMarkdownParser,
+         KnowledgeValidator,
+@@ -64,6 +79,7 @@ def main() -> int:
+     args = build_parser().parse_args()
+     knowledge_dir = Path(args.knowledge_dir or os.getenv("KNOWLEDGE_BASE_DIR") or "knowledge")
+ 
++    # ── 阶段 1: 解析 + 校验 ─────────────────────────────
+     started_at = utc_now_iso()
+     version_suffix = utc_now_compact()
+     knowledge_version = os.getenv("KNOWLEDGE_VERSION") or f"kb_{version_suffix}"
+@@ -121,6 +137,7 @@ def main() -> int:
+         print("status=validated")
+         return 0
+ 
++    # ── 阶段 2: Embedding（每批 20 条） ──────────────────
+     items = [item for document in report.documents for item in document.items]
+     embedding_texts = [build_embedding_text(item) for item in items]
+ 
+@@ -147,6 +164,7 @@ def main() -> int:
+     finally:
+         embedding_client.close()
+ 
++    # ── 阶段 3: 写入 Qdrant + 切换 alias ────────────────
+     store = QdrantKnowledgeStore(
+         QdrantStoreSettings(
+             url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"),
+@@ -156,8 +174,10 @@ def main() -> int:
+             vector_size=settings.embedding_dimension,
+         )
+     )
++    # 创建全新的 build collection 并写入全部向量
+     store.recreate_collection(build_collection)
+     store.upsert_items(build_collection, items, vectors, knowledge_version)
++    # 校验写入数量
+     point_count = store.count_points(build_collection)
+     if point_count != len(items):
+         repository.create_ingest_run(
+@@ -180,6 +200,7 @@ def main() -> int:
+         print(f"ERROR pointCountMismatch expected={len(items)} actual={point_count}")
+         return 1
+ 
++    # 原子切换 alias：新 collection 上线，旧 collection 保留
+     store.switch_alias(build_collection)
+     status = "success_with_warnings" if report.warnings else "success"
+     repository.create_ingest_run(
+diff --git a/scripts/init_metadata_db.py b/scripts/init_metadata_db.py
+index 2fa31c1..004a905 100644
+--- a/scripts/init_metadata_db.py
++++ b/scripts/init_metadata_db.py
+@@ -1,4 +1,11 @@
+-"""Initialize the RAG metadata SQLite database."""
++"""元数据库初始化脚本。
++
++创建 SQLite 数据库文件和所有表结构（幂等操作，可重复执行）。
++
++用法：
++    python scripts/init_metadata_db.py
++    python scripts/init_metadata_db.py --db-url sqlite:///custom/path.db
++"""
+ 
+ from __future__ import annotations
+ 
+diff --git a/scripts/review_due_report.py b/scripts/review_due_report.py
+index 119d19a..8e361d7 100644
+--- a/scripts/review_due_report.py
++++ b/scripts/review_due_report.py
+@@ -1,7 +1,12 @@
+-"""Placeholder for knowledge review due report generation."""
++"""知识复核提醒报告生成（占位）。
++
++计划在里程碑 2 实现：扫描所有知识的 reviewDueAt 字段，
++对即将到期或已过期的知识生成复核提醒列表。
++"""
+ 
+ 
+ def main() -> None:
++    """占位入口，输出当前状态。"""
+     print("review_due_report is planned for milestone 2")
+ 
+ 
+diff --git a/scripts/run_eval.py b/scripts/run_eval.py
+index e507fcc..015b2cf 100644
+--- a/scripts/run_eval.py
++++ b/scripts/run_eval.py
+@@ -1,4 +1,12 @@
+-"""Run RAG retrieval evaluation."""
++"""RAG 检索评测脚本。
++
++从知识库 Markdown 内嵌的 Eval Questions 或独立的 JSONL 文件加载评测用例，
++批量执行 RAG 查询并打分，生成 JSON 报告和终端摘要。
++
++用法：
++    python scripts/run_eval.py --knowledge-dir knowledge --fail-under 0.75
++    python scripts/run_eval.py --cases-jsonl eval/agent_cases.jsonl
++"""
+ 
+ from __future__ import annotations
+ 

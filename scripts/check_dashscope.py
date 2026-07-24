@@ -1,4 +1,11 @@
-"""Check DashScope embedding and rerank connectivity."""
+"""DashScope 连通性检查脚本。
+
+验证 Embedding 和 Rerank API 是否可用。
+使用示例查询和文档进行实际调用，检查返回结果的格式和维度。
+
+用法：
+    python scripts/check_dashscope.py
+"""
 
 from __future__ import annotations
 

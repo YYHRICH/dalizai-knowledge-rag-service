@@ -1,3 +1,15 @@
+"""知识缺口聚类服务。
+
+将相似的 "未命中/低置信度" 查询事件分组为缺口集群，帮助运营团队发现知识盲区。
+
+聚类算法：
+1. 获取未聚类的缺口事件 + 现有的 open 集群。
+2. 用 Embedding API 将所有文本向量化。
+3. 对每个新事件，计算与已有集群质心的余弦相似度。
+4. 相似度 >= threshold → 归入已有集群（增量合并）；否则 → 创建新集群。
+5. 用 Chat API 为集群生成标题和摘要。
+"""
+
 from __future__ import annotations
 
 import json
@@ -11,15 +23,20 @@ from apps.rag_service.app.storage.repository import KnowledgeGapClusterRecord, n
 
 
 class EmbeddingClient(Protocol):
+    """Embedding 能力的 Protocol 接口，不依赖具体实现。"""
+
     def embed_texts(self, texts: list[str]): ...
 
 
 class ClusterSummaryClient(Protocol):
+    """Cluster 摘要生成能力的 Protocol 接口，不依赖具体实现。"""
+
     def complete_json(self, system_prompt: str, user_prompt: str): ...
 
 
 @dataclass(frozen=True)
 class GapClusterCandidate:
+    """聚类过程中的一个候选集群（新建或待更新）。"""
     cluster_id: str
     event_ids: list[str]
     representative_query: str
@@ -46,6 +63,12 @@ class GapClusteringResult:
 
 
 class GapClusteringService:
+    """知识缺口聚类服务。
+
+    核心方法 ``cluster_unassigned_events`` 执行一次增量聚类：
+    处理尚未分配的缺口事件，将其归入已有集群或创建新集群。
+    """
+
     def __init__(
         self,
         repository,
@@ -54,6 +77,15 @@ class GapClusteringService:
         similarity_threshold: float = 0.82,
         max_examples: int = 5,
     ) -> None:
+        """初始化聚类服务。
+
+        Args:
+            repository: MetadataRepository 实例。
+            embedding_client: Embedding 客户端，用于将查询文本向量化。
+            summary_client: Chat 客户端（可选），用于生成集群标题和摘要。None 则用 fallback。
+            similarity_threshold: 归入同一集群的最低余弦相似度（默认 0.82）。
+            max_examples: 每个集群保存的查询示例数上限。
+        """
         self.repository = repository
         self.embedding_client = embedding_client
         self.summary_client = summary_client
@@ -61,6 +93,22 @@ class GapClusteringService:
         self.max_examples = max_examples
 
     def cluster_unassigned_events(self, limit: int = 100, dry_run: bool = False) -> GapClusteringResult:
+        """执行一次增量聚类。
+
+        流程：
+        1. 获取未聚类事件 + 已有 open 集群。
+        2. 全部文本向量化。
+        3. 对新事件按余弦相似度进行贪心匹配 → 归入已有集群或新建集群。
+        4. 用 Chat API 为集群生成标题和摘要。
+        5. 持久化：插入/更新集群 + 分配事件归属。
+
+        Args:
+            limit: 最多处理多少条未聚类事件。
+            dry_run: True 时只计算不写入数据库。
+
+        Returns:
+            GapClusteringResult: 本次聚类的处理统计和结果列表。
+        """
         events = self.repository.list_unclustered_gap_events(limit)
         if not events:
             return GapClusteringResult(0, 0, 0, 0, [])
@@ -160,7 +208,7 @@ class GapClusteringService:
         knowledge_type_guess = self._most_common(
             [existing.get("knowledge_type_guess")] + [event.get("knowledge_type_guess") for event in events]
         )
-        title, summary = self._summarize(query_examples, business_domain_guess, knowledge_type_guess)
+        title, summary = self._summarize(query_examples, business_domain_guess, knowledge_type_guess, dict(statuses))
         event_count = int(existing.get("event_count") or 0) + len(events)
         return GapClusterCandidate(
             cluster_id=group["cluster_id"],
@@ -184,19 +232,33 @@ class GapClusteringService:
         examples: list[str],
         business_domain_guess: str | None,
         knowledge_type_guess: str | None,
+        status_breakdown: dict[str, int] | None = None,
     ) -> tuple[str, str]:
         fallback_title = examples[0][:40]
         fallback_summary = "；".join(examples[:3])
         if self.summary_client is None:
             return fallback_title, fallback_summary
         system_prompt = (
-            "你是知识库运营助手。只输出 JSON，字段为 title 和 summary。"
-            "title 不超过 20 个中文字，summary 不超过 80 个中文字。"
+            "你是知识库运营助手。你的任务是根据用户未命中或低置信度的查询样本，"
+            "生成知识缺口集群的标题和摘要，帮助运营团队决定是否需要补充新知识。"
+            "只输出 JSON：{\"title\": \"...\", \"summary\": \"...\"}。"
+            ""
+            "title 要求（≤20个中文字）："
+            "- 像一个知识条目的标题，直接点明用户想要什么信息"
+            "- 正确示例：「卡券结算页不展示原因」「充电中途自动停止处理」「停车费减免条件咨询」"
+            "- 错误示例：「优惠券问题」「充电异常」「用户咨询」——太模糊，无法指导补充方向"
+            ""
+            "summary 要求（≤80个中文字）："
+            "- 概括这类用户的核心诉求，而非罗列原始查询"
+            "- 格式：时间范围 + 频次 + 用户问什么 + 当前覆盖情况"
+            "- 示例：「近期待补充：用户在充电中途停止后不确定能否换桩继续、是否多扣费。"
+            "当前知识库无覆盖，建议新增充电中断后的计费规则和处理流程。」"
         )
         user_prompt = json.dumps(
             {
                 "businessDomainGuess": business_domain_guess,
                 "knowledgeTypeGuess": knowledge_type_guess,
+                "statusBreakdown": status_breakdown or {},
                 "queries": examples,
             },
             ensure_ascii=False,

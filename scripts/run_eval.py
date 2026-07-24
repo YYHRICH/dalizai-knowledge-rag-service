@@ -1,4 +1,12 @@
-"""Run RAG retrieval evaluation."""
+"""RAG 检索评测脚本。
+
+从知识库 Markdown 内嵌的 Eval Questions 或独立的 JSONL 文件加载评测用例，
+批量执行 RAG 查询并打分，生成 JSON 报告和终端摘要。
+
+用法：
+    python scripts/run_eval.py --knowledge-dir knowledge --fail-under 0.75
+    python scripts/run_eval.py --cases-jsonl eval/agent_cases.jsonl
+"""
 
 from __future__ import annotations
 

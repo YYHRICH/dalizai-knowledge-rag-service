@@ -1,4 +1,13 @@
-"""Cluster unassigned knowledge gap events."""
+"""知识缺口聚类脚本。
+
+将尚未分配的知识缺口事件按语义相似度聚类，归入已有集群或创建新集群。
+支持 dry-run 模式预览结果和 --disable-llm 模式跳过 LLM 摘要生成。
+
+用法：
+    python scripts/cluster_gap_events.py                          # 默认聚类
+    python scripts/cluster_gap_events.py --dry-run                # 仅预览
+    python scripts/cluster_gap_events.py --disable-llm            # 仅用规则生成标题
+"""
 
 from __future__ import annotations
 

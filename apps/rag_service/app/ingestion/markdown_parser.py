@@ -1,3 +1,14 @@
+"""Markdown 知识库解析器。
+
+将 ``knowledge/`` 目录下的 Markdown 文件解析为结构化的 KnowledgeDocument。
+解析约定：
+- YAML front matter 作为文档级元信息（``---`` 包裹）。
+- 一级标题（``#``）作为文档标题。
+- 二级标题（``## knowledgeId｜标题``）作为知识条目，用 ``|`` 或 ``｜`` 分隔 ID 和标题。
+- 三级标题（``###``）作为条目内的区块（Summary、Content、Keywords 等）。
+- Eval Questions 区块为 JSON 数组格式的评测问题列表。
+"""
+
 from __future__ import annotations
 
 import json
@@ -9,31 +20,71 @@ import yaml
 
 from .models import EvalQuestion, KnowledgeDocument, KnowledgeItem, ValidationIssue
 
+# ── 正则表达式 ───────────────────────────────────────────────
+
 FRONT_MATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.S)
+"""匹配 YAML front matter：文件开头的 ``---`` 到 ``---`` 之间的内容。"""
+
 KNOWLEDGE_HEADING_RE = re.compile(r"^##\s+([^|｜\s]+)\s*[|｜]\s*(.+?)\s*$", re.M)
+"""匹配知识条目标题：``## knowledgeId｜标题``。支持中英文竖线。"""
+
 SECTION_HEADING_RE = re.compile(r"^###\s+(.+?)\s*$", re.M)
+"""匹配三级标题：``### Section Name``。"""
+
 DOCUMENT_TITLE_RE = re.compile(r"^#\s+(.+?)\s*$", re.M)
+"""匹配文档一级标题：``# Document Title``。"""
+
+# ── 三级标题的别名映射 ──────────────────────────────────────
 
 SECTION_ALIASES = {
+    # Summary
     "summary": "Summary",
     "摘要": "Summary",
+    # Content
     "content": "Content",
     "正文": "Content",
+    # Allowed Claims
     "allowed claims": "Allowed Claims",
     "允许表达": "Allowed Claims",
+    # Forbidden Claims
     "forbidden claims": "Forbidden Claims",
     "禁止表达": "Forbidden Claims",
+    # Keywords
     "keywords": "Keywords",
     "关键词": "Keywords",
+    # Similar Questions
     "similar questions": "Similar Questions",
     "相似问法": "Similar Questions",
+    # Eval Questions
     "eval questions": "Eval Questions",
     "评测问题": "Eval Questions",
 }
+"""三级标题的中英文别名映射。编辑器可能使用中文或英文标题，此处统一为规范名称。"""
 
 
 class KnowledgeMarkdownParser:
+    """Markdown 知识库解析器。
+
+    负责：
+    1. 遍历知识库目录，找到所有 .md 文件。
+    2. 解析每个文件：提取 YAML front matter、文档标题、知识条目。
+    3. 将三级标题区块映射到 KnowledgeItem 的对应字段。
+    4. 解析 Eval Questions 的 JSON 数组。
+    """
+
     def parse_directory(self, base_dir: Path | str) -> tuple[list[KnowledgeDocument], list[ValidationIssue]]:
+        """解析整个知识库目录。
+
+        递归查找所有 .md 文件，逐个解析，汇总文档和校验问题。
+
+        Args:
+            base_dir: 知识库根目录路径。
+
+        Returns:
+            (documents, issues) 元组。
+            documents: 成功解析的文档（解析失败的文件不会出现在此列表中）。
+            issues: 所有文件的解析和校验问题。
+        """
         base_path = Path(base_dir)
         documents: list[KnowledgeDocument] = []
         issues: list[ValidationIssue] = []
@@ -45,6 +96,20 @@ class KnowledgeMarkdownParser:
         return documents, issues
 
     def parse_file(self, path: Path | str) -> tuple[KnowledgeDocument | None, list[ValidationIssue]]:
+        """解析单个 Markdown 文件。
+
+        流程：
+        1. 按 UTF-8 with BOM 编码读取。
+        2. 提取 YAML front matter。
+        3. 提取一级标题作为文档标题。
+        4. 遍历二级标题，解析每个知识条目的三级标题区块。
+
+        Args:
+            path: Markdown 文件路径。
+
+        Returns:
+            (document, issues) 元组。如果 YAML front matter 缺失则 document 为 None。
+        """
         file_path = Path(path)
         issues: list[ValidationIssue] = []
         text = file_path.read_text(encoding="utf-8-sig")
@@ -66,6 +131,10 @@ class KnowledgeMarkdownParser:
         path: Path,
         issues: list[ValidationIssue],
     ) -> dict[str, Any]:
+        """解析 YAML front matter 为字典。
+
+        解析失败时记录 error 并返回空字典。
+        """
         try:
             data = yaml.safe_load(front_matter) or {}
         except yaml.YAMLError as exc:
@@ -83,6 +152,12 @@ class KnowledgeMarkdownParser:
         metadata: dict[str, Any],
         issues: list[ValidationIssue],
     ) -> list[KnowledgeItem]:
+        """解析正文中所有知识条目。
+
+        用 ``## knowledgeId｜标题`` 正则匹配所有二级标题，
+        每个标题之间的内容作为一个知识条目区块。
+        条目区块内再按三级标题解析各字段。
+        """
         headings = list(KNOWLEDGE_HEADING_RE.finditer(body))
         items: list[KnowledgeItem] = []
         if not headings:
@@ -121,6 +196,11 @@ class KnowledgeMarkdownParser:
         return items
 
     def _parse_sections(self, block: str) -> dict[str, str]:
+        """将知识条目区块按三级标题切分为字段字典。
+
+        每个 ``### 标题`` 之间的内容归入该标题对应的字段。
+        标题名称通过 SECTION_ALIASES 映射为规范名。
+        """
         matches = list(SECTION_HEADING_RE.finditer(block))
         sections: dict[str, str] = {}
         for index, match in enumerate(matches):

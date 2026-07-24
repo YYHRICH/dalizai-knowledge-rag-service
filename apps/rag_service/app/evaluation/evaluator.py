@@ -1,3 +1,9 @@
+"""RAG 评测器。
+
+对一组评测用例批量执行 RAG 查询并对结果打分。
+评测指标包括：状态匹配、上下文精确率/召回率、忠实度代理、相关性代理。
+"""
+
 from __future__ import annotations
 
 from statistics import mean
@@ -12,14 +18,23 @@ from apps.rag_service.app.schemas.rag import RagFilters, RagQueryRequest, RagQue
 
 
 class RagEvaluator:
+    """RAG 评测器。将评测用例转为 RAG 请求，收集结果并汇总。"""
+
     def __init__(self, query_service) -> None:
+        """初始化评测器。
+
+        Args:
+            query_service: RagQueryService 实例，用于执行实际的 RAG 查询。
+        """
         self.query_service = query_service
 
     def evaluate(self, cases: list[RagEvalCase]) -> RagEvalReport:
+        """批量评测一组用例。"""
         results = [self.evaluate_case(case) for case in cases]
         return RagEvalReport(summary=self._summary(results), results=results)
 
     def evaluate_case(self, case: RagEvalCase) -> RagEvalCaseResult:
+        """评测单个用例：用 case 中的参数构造 RAG 请求，执行查询并打分。"""
         response = self.query_service.query(
             RagQueryRequest(
                 requestId=f"eval_{case.id}",
@@ -38,6 +53,7 @@ class RagEvaluator:
         return score_case(case, response)
 
     def _summary(self, results: list[RagEvalCaseResult]) -> RagEvalSummary:
+        """计算全部用例的汇总统计。所有指标取均值。"""
         if not results:
             return RagEvalSummary(0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         return RagEvalSummary(
@@ -55,6 +71,15 @@ class RagEvaluator:
 
 
 def score_case(case: RagEvalCase, response: RagQueryResponse) -> RagEvalCaseResult:
+    """对单个评测用例打分。
+
+    加权公式：
+    score = 0.20 * status_match + 0.25 * context_precision
+          + 0.25 * context_recall + 0.15 * faithfulness_proxy
+          + 0.15 * response_relevancy_proxy
+
+    状态匹配权重最低（粗粒度），上下文精确率和召回率是核心指标。
+    """
     retrieved_context_ids = [item.chunkId for item in response.items]
     retrieved_knowledge_ids = [item.knowledgeId for item in response.items]
     expected_context_ids = case.expected_context_ids
