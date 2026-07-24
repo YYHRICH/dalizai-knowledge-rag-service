@@ -13,3 +13,4 @@ Thumbs.db
 # Local incoming datasets and runtime metadata DB
 data/
 eval/reports/
+.pytest_tmp/
